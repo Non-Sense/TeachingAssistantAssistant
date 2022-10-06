@@ -18,7 +18,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-cli:0.3.5")
     implementation("io.arrow-kt:arrow-core:1.1.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.4")
-    implementation("com.charleskorn.kaml:kaml:0.48.0")
+    implementation("com.charleskorn.kaml:kaml:0.49.0")
     testImplementation(kotlin("test"))
 }
 
