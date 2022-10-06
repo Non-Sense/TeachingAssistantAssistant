@@ -27,6 +27,9 @@ fun unzipFile(targetFilePath: Path, destDirPath: Path = targetFilePath.parent, z
         val buffer = ByteArray(unzipBufferSize)
         while (f.nextEntry.also { zipEntry = it } != null) {
             val entryPath = Paths.get(zipEntry!!.name).normalize()
+            if(entryPath.startsWith("__MACOSX")){
+                continue
+            }
             if (entryPath.startsWith(Paths.get(".."))) {
                 throw IllegalStateException("File is outside extraction target directory.")
             }

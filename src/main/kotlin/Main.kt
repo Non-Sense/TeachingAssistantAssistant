@@ -26,6 +26,30 @@ enum class Encoding(val charset: Charset) {
     Unknown(Charset.defaultCharset())
 }
 
+enum class Judge(private val displayName: String) {
+    AC("AC"),
+    WA("WA"),
+    RE("RE"),
+    CE("CE"),
+    Unknown("??");
+
+    companion object {
+        fun fromStringInput(input: String): Judge {
+            return when(input) {
+                "AC", "A", "ac", "a" -> AC
+                "WA", "W", "wa", "w" -> WA
+                "RE", "R", "re", "r" -> RE
+                "CE", "C", "ce", "c" -> CE
+                else -> Unknown
+            }
+        }
+    }
+
+    override fun toString(): String {
+        return displayName
+    }
+}
+
 data class CompileResult(
     val result: Either<String, String>,
     val encoding: Encoding,
@@ -49,7 +73,7 @@ data class TestResult(
     val output: String = "",
     val errorOutput: String = "",
     val exitCode: Int = -1,
-    val isPassTest: Boolean = false,
+    val judge: Judge = Judge.Unknown,
     val judgeInfo: InfoForJudge,
     val testCase: TestCase = TestCase(""),
     val command: String = ""
@@ -69,7 +93,7 @@ data class TestCase(
 @Serializable
 data class Task(
     val word: List<String>,
-    val testcase: List<TestCase>?
+    val testcase: List<TestCase> = listOf()
 )
 
 @Serializable
@@ -123,8 +147,20 @@ suspend fun main(args: Array<String>) {
         shortName = "t",
         description = "テストを並列実行しないようにする。"
     ).default(false)
+    val manualJudge by parser.option(
+        ArgType.Boolean,
+        fullName = "manualJudge",
+        shortName = "m",
+        description = "手動で判定する。"
+    ).default(false)
 
     parser.parse(args)
+
+    if(manualJudge && !runTestsSerial) {
+        println("手動判定するには-tオプションも指定してください")
+        return
+    }
+
     println("rootPath: $rootPath")
     if(Files.notExists(Path(rootPath))) {
         println("指定されたrootPathは存在しないようです")
@@ -166,7 +202,7 @@ suspend fun main(args: Array<String>) {
         return
 
     println("testing...")
-    val testResults = runTests(config, compileResults, runTestsSerial)
+    val testResults = runTests(config, compileResults, runTestsSerial, manualJudge)
     println("test done!")
     println()
 
@@ -198,29 +234,31 @@ suspend fun main(args: Array<String>) {
 
 }
 
-suspend fun compile(workspacePath: Path, config: Config, keepOriginalDirectory: Boolean): List<CompileResult>{
-    val jobs = mutableListOf<Deferred<CompileResult>>()
-    val count = AtomicInteger(0)
-    val printProgress = AtomicInteger(10)
-    var totalSize = 1
-    fun printProgress(n:Int) {
-        printProgress.getAndUpdate {
-            val p = (n.toFloat()/totalSize.toFloat()*100f).toInt()
-            if(it<=p) {
-                print("$it% ")
-                it+10
-            } else {
-                it
-            }
+fun printProgress(printProgress: AtomicInteger, n: Int, totalSize: Int) {
+    printProgress.getAndUpdate {
+        val p = (n.toFloat()/totalSize.toFloat()*100f).toInt()
+        if(it <= p) {
+            print("$it% ")
+            it + 10
+        } else {
+            it
         }
     }
+}
+
+suspend fun compile(workspacePath: Path, config: Config, keepOriginalDirectory: Boolean): List<CompileResult> {
+    val jobs = mutableListOf<Deferred<CompileResult>>()
+    val counter = AtomicInteger(0)
+    val printProgress = AtomicInteger(10)
+    var totalSize = 1
+
     workspacePath.toFile().listFiles()?.forEach { studentBase ->
         val base = studentBase.resolve("sources")
         findJavaSourceFiles(base.toPath()).forEach { javaSource ->
             val dstPath = calcDstPath(keepOriginalDirectory, base, studentBase, javaSource)
             jobs.add(CoroutineScope(Dispatchers.Default).async {
                 val res = compileJavaSource(javaSource, dstPath, config.compileTimeout)
-                printProgress(count.addAndGet(1))
+                printProgress(printProgress, counter.addAndGet(1), totalSize)
                 CompileResult(res.first, res.second, javaSource, studentBase, base, dstPath)
             })
         }
@@ -229,11 +267,70 @@ suspend fun compile(workspacePath: Path, config: Config, keepOriginalDirectory: 
     return jobs.awaitAll().also { println() }
 }
 
+fun getJudgeFromInput(): Judge {
+    while(true) {
+        print("judge?: ")
+        val str = readLine()
+        if(str == null) {
+            println("input error")
+            continue
+        }
+        val judge = Judge.fromStringInput(str)
+
+        if(judge == Judge.Unknown) {
+            println("invalid input")
+            continue
+        }
+        return judge
+    }
+}
+
 suspend fun runTests(
     config: Config,
     compileResults: List<CompileResult>,
-    runTestsSerial: Boolean
+    runTestsSerial: Boolean,
+    manualJudge: Boolean
 ): List<Result<TestResult>> {
+
+    val printProgress = AtomicInteger(10)
+    var totalSize = 1
+
+    val counter = AtomicInteger(0)
+
+    fun makeTestJob(info: InfoForJudge): List<Pair<Deferred<Result<TestResult>>, Pair<InfoForJudge, TestCase?>>> {
+        val testcases = config.tasks[info.taskName]
+        // CE
+        if(info.compileResult.isLeft()) {
+            return listOf(CoroutineScope(Dispatchers.Default).async {
+                if(!runTestsSerial)
+                    printProgress(printProgress, counter.addAndGet(1), totalSize)
+                Result.success(TestResult(judgeInfo = info, judge = Judge.CE))
+            } to (info to null))
+        }
+        // ??
+        if(testcases?.testcase == null || info.className == null) {
+            return listOf(CoroutineScope(Dispatchers.Default).async {
+                if(!runTestsSerial)
+                    printProgress(printProgress, counter.addAndGet(1), totalSize)
+                Result.success(TestResult(judgeInfo = info))
+            } to (info to null))
+        }
+        // run
+        return testcases.testcase.map { testcase ->
+            CoroutineScope(Dispatchers.Default).async {
+                codeTest(info, testcase, config.runningTimeout).recover {
+                    TestResult(
+                        errorOutput = "unnormal error ${it.stackTrace}",
+                        judgeInfo = info
+                    )
+                }.also {
+                    if(!runTestsSerial)
+                        printProgress(printProgress, counter.addAndGet(1), totalSize)
+                }
+            } to (info to testcase)
+        }
+    }
+
     val judgeInfo = compileResults.map {
         val t = determineTaskNumberAndPackageName(config, it.javaSource, it.encoding.charset)
         InfoForJudge(
@@ -247,43 +344,9 @@ suspend fun runTests(
         )
     }
 
-    val printProgress = AtomicInteger(10)
-    var totalSize = 1
-    fun printProgress(n:Int) {
-        printProgress.getAndUpdate {
-            val p = (n.toFloat()/totalSize.toFloat()*100f).toInt()
-            if(it<=p) {
-                print("$it% ")
-                it+10
-            } else {
-                it
-            }
-        }
-    }
 
-    val counter = AtomicInteger(0)
-    val testJobs = judgeInfo.flatMap { info ->
-        val testcases = config.tasks[info.taskName]
-        if(testcases?.testcase == null || info.className == null) {
-            listOf(CoroutineScope(Dispatchers.Default).async {
-                printProgress(counter.addAndGet(1))
-                Result.success(TestResult(judgeInfo = info))
-            } to (info to null))
-        } else {
-            testcases.testcase.map { testcase ->
-                CoroutineScope(Dispatchers.Default).async {
-                    codeTest(info, testcase, config.runningTimeout).recover {
-                        TestResult(
-                            errorOutput = "unnormal error ${it.stackTrace}",
-                            judgeInfo = info
-                        )
-                    }.also { printProgress(counter.addAndGet(1)) }
-                } to (info to testcase)
-            }
-        }
-    }
-
-    totalSize = testJobs.size.takeIf { it!=0 }?:1
+    val testJobs = judgeInfo.flatMap { info -> makeTestJob(info) }
+    totalSize = testJobs.size.takeIf { it != 0 } ?: 1
     if(!runTestsSerial)
         return testJobs.map { it.first }.awaitAll().also { println() }
 
@@ -293,33 +356,44 @@ suspend fun runTests(
         val testcase = it.second.second
         if(testcase != null && info.className != null)
             println("running: ${info.studentID}:${info.className}  ${info.taskName}:${testcase.name}")
-        job.await()
+        if(!manualJudge || (testcase == null || info.className == null)) {
+            job.await()
+        } else {
+            job.await().map { result ->
+                testcase.expect.joinToString("\n").takeIf { s -> s.isNotBlank() }?.let { s ->
+                    println("expected:")
+                    println(s)
+                }
+                result.errorOutput.takeIf { s -> s.isNotBlank() }?.let { s ->
+                    println("stderr:")
+                    println(s)
+                }
+                result.output.takeIf { s -> s.isNotBlank() }?.let { s ->
+                    println("stdout:")
+                    println(s.trimEnd { t -> t == '\n' || t == '\n' || t == ' ' || t == '\t' })
+                }
+
+                val judge = getJudgeFromInput()
+                println()
+                result.copy(judge = judge)
+            }
+        }
     }
 }
 
-fun makeResultTable(testResults: List<Result<TestResult>>): Map<String, Map<String, String>> {
-    val resultTable = mutableMapOf<String, MutableMap<String, String>>()
+fun makeResultTable(testResults: List<Result<TestResult>>): Map<String, Map<String, Judge>> {
+    val resultTable = mutableMapOf<String, MutableMap<String, Judge>>()
     for(res in testResults) {
         val r = res.getOrNull()
         if(r == null) {
-            println("unknown error")
+            println("unknown error: ${res.exceptionOrNull()?.stackTrace}")
             continue
         }
 
         val studentId = r.judgeInfo.studentID
         val taskName = r.judgeInfo.taskName
         val testCaseName = r.testCase.name
-        val match = r.isPassTest
-        val runningError = r.errorOutput.isNotBlank()
-        val isCompileError = r.judgeInfo.compileResult.isLeft()
-        val stat = when {
-            taskName == "unknown" -> "??"
-            isCompileError -> "CE"
-            runningError -> "RE"
-            !match -> "WA"
-            match -> "AC"
-            else -> "??"
-        }
+        val stat = r.judge
 
         resultTable.computeIfAbsent(studentId) {
             mutableMapOf()
@@ -332,7 +406,7 @@ fun writeDetail(
     outputStream: BufferedWriter,
     testResults: List<Result<TestResult>>,
     workspacePath: Path,
-    resultTable: Map<String, Map<String, String>>,
+    resultTable: Map<String, Map<String, Judge>>,
     studentNameTable: Map<String, String>
 ) {
     outputStream.appendLine("studentID,studentName,sourcePath,taskName,testCase,compileErrorOutput,arg,input,stat,expect,output,errorOutput,package,class,runCommand")
@@ -369,14 +443,14 @@ fun writeDetail(
 fun writeSummary(
     tasks: Map<String, Task>,
     outputStream: BufferedWriter,
-    resultTable: Map<String, Map<String, String>>,
+    resultTable: Map<String, Map<String, Judge>>,
     studentNameTable: Map<String, String>
 ) {
     val taskNames = tasks.mapValues {
-        it.value.testcase?.size ?: 0
+        it.value.testcase.size
     }
     val taskNameList = tasks.flatMap {
-        (it.value.testcase ?: listOf()).map { testCase ->
+        (it.value.testcase).map { testCase ->
             "${it.key}:${testCase.name}"
         }
     }
@@ -386,9 +460,12 @@ fun writeSummary(
         val studentID = row.key
         val studentName = studentNameTable[studentID] ?: ""
         val data = row.value
-        val stats = taskNameList.map { data[it] ?: data[it.takeWhile { c -> c != ':' }.plus(':')] ?: data["unknown:"] }
+        val stats = taskNameList.map {
+            data[it] ?: data[it.takeWhile { c -> c != ':' }.plus(':')] ?: data["unknown:"] ?: Judge.Unknown
+        }
+
         val ll = taskNames.mapValues { n ->
-            taskNameList.filter { it.startsWith(n.key) }.count { data[it] == "AC" } to n.value
+            taskNameList.filter { it.startsWith(n.key) }.count { data[it] == Judge.AC } to n.value
         }.map { (it.value.first.toFloat()/it.value.second.toFloat()*100f).toInt().toString() }
         outputStream.appendLine("""$studentID,$studentName,${ll.joinToString()},${stats.joinToString()}""")
     }
@@ -426,11 +503,23 @@ fun codeTest(infoForJudge: InfoForJudge, testCase: TestCase, runningTimeOutMilli
     val out = output.replace('\r', ' ').replace('\n', ' ')
     val pass = testCase.expectRegex.firstOrNull()?.matches(out) ?: false
 
+    val runningError = errorOutput.isNotBlank()
+    val isCompileError = infoForJudge.compileResult.isLeft()
+
+    val stat = when {
+        infoForJudge.taskName == "unknown" -> Judge.Unknown
+        isCompileError -> Judge.CE
+        runningError -> Judge.RE
+        !pass -> Judge.WA
+        pass -> Judge.AC
+        else -> Judge.Unknown
+    }
+
     TestResult(
         output,
         errorOutput,
         process.exitValue(),
-        pass,
+        stat,
         infoForJudge,
         testCase,
         command
