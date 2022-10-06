@@ -11,7 +11,6 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
 import java.io.BufferedWriter
 import java.io.File
-import java.io.FileWriter
 import java.nio.charset.Charset
 import java.nio.file.Files
 import java.nio.file.Path
@@ -29,8 +28,11 @@ enum class Encoding(val charset: Charset) {
 enum class Judge(private val displayName: String) {
     AC("AC"),
     WA("WA"),
+    TLE("TLE"),
     RE("RE"),
     CE("CE"),
+    IE("IE"),
+    NF("NF"),
     Unknown("??");
 
     companion object {
@@ -61,7 +63,7 @@ data class CompileResult(
 
 data class InfoForJudge(
     val studentID: String,
-    val taskName: String,
+    val taskName: String?,
     val classFileDir: Path,
     val className: String?,
     val packageName: String?,
@@ -76,7 +78,8 @@ data class TestResult(
     val judge: Judge = Judge.Unknown,
     val judgeInfo: InfoForJudge,
     val testCase: TestCase = TestCase(""),
-    val command: String = ""
+    val command: String = "",
+    val runTimeNano: Long? = null
 )
 
 @Serializable
@@ -210,7 +213,7 @@ suspend fun main(args: Array<String>) {
     val outFile = Path(outputPath).resolve(config.detailFileName).toFile()
     val resultTable = makeResultTable(testResults)
     runCatching {
-        BufferedWriter(FileWriter(outFile, outputCharset, false))
+        outFile.bufferedWriter(outputCharset)
     }.getOrElse {
         println("結果詳細ファイルのオープンに失敗しました")
         println("ファイルがロックされている可能性があります")
@@ -221,7 +224,7 @@ suspend fun main(args: Array<String>) {
 
     val summaryFile = Path(outputPath).resolve(config.summaryFileName).toFile()
     runCatching {
-        BufferedWriter(FileWriter(summaryFile, outputCharset, false))
+        summaryFile.bufferedWriter(outputCharset)
     }.getOrElse {
         println("結果概要ファイルのオープンに失敗しました")
         println("ファイルがロックされている可能性があります")
@@ -290,38 +293,42 @@ suspend fun runTests(
     compileResults: List<CompileResult>,
     runTestsSerial: Boolean,
     manualJudge: Boolean
-): List<Result<TestResult>> {
+): List<TestResult> {
 
     val printProgress = AtomicInteger(10)
     var totalSize = 1
 
     val counter = AtomicInteger(0)
 
-    fun makeTestJob(info: InfoForJudge): List<Pair<Deferred<Result<TestResult>>, Pair<InfoForJudge, TestCase?>>> {
+    fun makeTestJob(info: InfoForJudge): List<Pair<Deferred<TestResult>, Pair<InfoForJudge, TestCase?>>> {
+        fun f(judge: Judge): List<Pair<Deferred<TestResult>, Pair<InfoForJudge, TestCase?>>> {
+            return listOf(CoroutineScope(Dispatchers.Default).async {
+                if(!runTestsSerial)
+                    printProgress(printProgress, counter.addAndGet(1), totalSize)
+                TestResult(judgeInfo = info, judge = judge)
+            } to (info to null))
+        }
+        // NF
+        if(info.taskName == null) {
+            return f(Judge.NF)
+        }
         val testcases = config.tasks[info.taskName]
         // CE
         if(info.compileResult.isLeft()) {
-            return listOf(CoroutineScope(Dispatchers.Default).async {
-                if(!runTestsSerial)
-                    printProgress(printProgress, counter.addAndGet(1), totalSize)
-                Result.success(TestResult(judgeInfo = info, judge = Judge.CE))
-            } to (info to null))
+            return f(Judge.CE)
         }
         // ??
         if(testcases?.testcase == null || info.className == null) {
-            return listOf(CoroutineScope(Dispatchers.Default).async {
-                if(!runTestsSerial)
-                    printProgress(printProgress, counter.addAndGet(1), totalSize)
-                Result.success(TestResult(judgeInfo = info))
-            } to (info to null))
+            return f(Judge.Unknown)
         }
-        // run
+        // run test
         return testcases.testcase.map { testcase ->
             CoroutineScope(Dispatchers.Default).async {
-                codeTest(info, testcase, config.runningTimeout).recover {
+                codeTest(info, testcase, config.runningTimeout).getOrElse {
                     TestResult(
-                        errorOutput = "unnormal error ${it.stackTrace}",
-                        judgeInfo = info
+                        errorOutput = "internal error: ${it.stackTraceToString().replace("\r", "").escaped()}",
+                        judgeInfo = info,
+                        judge = Judge.IE
                     )
                 }.also {
                     if(!runTestsSerial)
@@ -350,50 +357,52 @@ suspend fun runTests(
     if(!runTestsSerial)
         return testJobs.map { it.first }.awaitAll().also { println() }
 
-    return testJobs.map {
-        val job = it.first
-        val info = it.second.first
-        val testcase = it.second.second
+    suspend fun jobTransform(pair: Pair<Deferred<TestResult>, Pair<InfoForJudge, TestCase?>>): TestResult {
+        val job = pair.first
+        val info = pair.second.first
+        val testcase = pair.second.second
         if(testcase != null && info.className != null)
-            println("running: ${info.studentID}:${info.className}  ${info.taskName}:${testcase.name}")
+            print("running: ${info.studentID}:${info.className}  \t${info.taskName}:${testcase.name}\t-> ")
         if(!manualJudge || (testcase == null || info.className == null)) {
-            job.await()
-        } else {
-            job.await().map { result ->
-                testcase.expect.joinToString("\n").takeIf { s -> s.isNotBlank() }?.let { s ->
-                    println("expected:")
-                    println(s)
-                }
-                result.errorOutput.takeIf { s -> s.isNotBlank() }?.let { s ->
-                    println("stderr:")
-                    println(s)
-                }
-                result.output.takeIf { s -> s.isNotBlank() }?.let { s ->
-                    println("stdout:")
-                    println(s.trimEnd { t -> t == '\n' || t == '\n' || t == ' ' || t == '\t' })
-                }
-
-                val judge = getJudgeFromInput()
-                println()
-                result.copy(judge = judge)
+            return job.await().also { r ->
+                if(testcase != null && info.className != null)
+                    println("${r.judge}")
             }
         }
+
+        println()
+        val result = job.await()
+        testcase.expect.joinToString("\n").takeIf { s -> s.isNotBlank() }?.let { s ->
+            println("expected:")
+            println(s)
+        }
+        result.errorOutput.takeIf { s -> s.isNotBlank() }?.let { s ->
+            println("stderr:")
+            println(s)
+        }
+        result.output.takeIf { s -> s.isNotBlank() }?.let { s ->
+            println("stdout:")
+            println(s.trimEnd { t -> t == '\n' || t == '\n' || t == ' ' || t == '\t' })
+        }
+
+        val judge = getJudgeFromInput()
+        println()
+        return result.copy(judge = judge)
+    }
+
+    return testJobs.map {
+        jobTransform(it)
     }
 }
 
-fun makeResultTable(testResults: List<Result<TestResult>>): Map<String, Map<String, Judge>> {
+fun makeResultTable(testResults: List<TestResult>): Map<String, Map<String, Judge>> {
     val resultTable = mutableMapOf<String, MutableMap<String, Judge>>()
-    for(res in testResults) {
-        val r = res.getOrNull()
-        if(r == null) {
-            println("unknown error: ${res.exceptionOrNull()?.stackTrace}")
-            continue
-        }
+    for(result in testResults) {
 
-        val studentId = r.judgeInfo.studentID
-        val taskName = r.judgeInfo.taskName
-        val testCaseName = r.testCase.name
-        val stat = r.judge
+        val studentId = result.judgeInfo.studentID
+        val taskName = result.judgeInfo.taskName
+        val testCaseName = result.testCase.name
+        val stat = result.judge
 
         resultTable.computeIfAbsent(studentId) {
             mutableMapOf()
@@ -404,38 +413,35 @@ fun makeResultTable(testResults: List<Result<TestResult>>): Map<String, Map<Stri
 
 fun writeDetail(
     outputStream: BufferedWriter,
-    testResults: List<Result<TestResult>>,
+    testResults: List<TestResult>,
     workspacePath: Path,
     resultTable: Map<String, Map<String, Judge>>,
     studentNameTable: Map<String, String>
 ) {
-    outputStream.appendLine("studentID,studentName,sourcePath,taskName,testCase,compileErrorOutput,arg,input,stat,expect,output,errorOutput,package,class,runCommand")
-    for(res in testResults) {
-        val r = res.getOrNull()
-        if(r == null) {
-            println("unknown error")
-            continue
-        }
+    outputStream.appendLine("studentID,studentName,sourcePath,taskName,testCase,arg,input,stat,time(ms),expect,output,errorOutput,compileErrorOutput,package,class,runCommand")
+    for(result in testResults) {
 
-        val studentId = r.judgeInfo.studentID
-        val studentName = studentNameTable[r.judgeInfo.studentID] ?: ""
-        val sourcePath = r.judgeInfo.javaSource.absolutePath.removeRange(0..workspacePath.absolutePathString().length)
-        val packageName = r.judgeInfo.packageName ?: ""
-        val className = r.judgeInfo.className
-        val taskName = r.judgeInfo.taskName
-        val compileError = r.judgeInfo.compileResult.fold({ it }, { "" }).trimEnd().replace(',', ' ').escaped()
-        val command = r.command
-        val arg = r.testCase.arg
-        val input = r.testCase.input.joinToString("\n").escaped()
-        val expect = r.testCase.expect.joinToString("\n").escaped()
-        val output = r.output.trimEnd().escaped()
-        val errorOutput = r.errorOutput.trimEnd().escaped()
-        val testCaseName = r.testCase.name
+        val studentId = result.judgeInfo.studentID
+        val studentName = studentNameTable[result.judgeInfo.studentID] ?: ""
+        val sourcePath =
+            result.judgeInfo.javaSource.absolutePath.removeRange(0..workspacePath.absolutePathString().length)
+        val packageName = result.judgeInfo.packageName ?: ""
+        val className = result.judgeInfo.className ?: ""
+        val taskName = result.judgeInfo.taskName ?: ""
+        val compileError = result.judgeInfo.compileResult.fold({ it }, { "" }).trimEnd().replace(',', ' ').escaped()
+        val command = result.command
+        val arg = result.testCase.arg
+        val input = result.testCase.input.joinToString("\n").escaped()
+        val expect = result.testCase.expect.joinToString("\n").escaped()
+        val output = result.output.trimEnd().escaped()
+        val errorOutput = result.errorOutput.trimEnd().escaped()
+        val testCaseName = result.testCase.name
+        val time = result.runTimeNano?.let { String.format("%.3f", it/1000000f) } ?: ""
 
         val stat = resultTable[studentId]?.get("$taskName:$testCaseName") ?: "__"
 
         outputStream.appendLine(
-            """$studentId,$studentName,$sourcePath,$taskName,$testCaseName,$compileError,$arg,$input,$stat,$expect,$output,$errorOutput,$packageName,$className,$command"""
+            """$studentId,$studentName,$sourcePath,$taskName,$testCaseName,$arg,$input,$stat,$time,$expect,$output,$errorOutput,$compileError,$packageName,$className,$command"""
         )
     }
 }
@@ -461,7 +467,7 @@ fun writeSummary(
         val studentName = studentNameTable[studentID] ?: ""
         val data = row.value
         val stats = taskNameList.map {
-            data[it] ?: data[it.takeWhile { c -> c != ':' }.plus(':')] ?: data["unknown:"] ?: Judge.Unknown
+            data[it] ?: data[it.takeWhile { c -> c != ':' }.plus(':')] ?: data["unknown:"] ?: Judge.NF
         }
 
         val ll = taskNames.mapValues { n ->
@@ -486,6 +492,7 @@ fun codeTest(infoForJudge: InfoForJudge, testCase: TestCase, runningTimeOutMilli
         """java -Duser.language=en -classpath "$classDir" ${infoForJudge.packageName?.plus(".") ?: ""}${infoForJudge.className} ${testCase.arg}"""
     //println(command)
     val process = runtime.exec(command)
+    val startTime = System.nanoTime()
     val outputStream = process.outputStream.buffered().writer()
     if(testCase.input.isNotEmpty()) {
         testCase.input.forEach { inputString ->
@@ -493,11 +500,11 @@ fun codeTest(infoForJudge: InfoForJudge, testCase: TestCase, runningTimeOutMilli
         }
     }
     outputStream.flush()
-    outputStream.close()
-    process.waitFor(runningTimeOutMilli, TimeUnit.MILLISECONDS)
-    val errorOutput = String(process.errorStream.readAllBytes(), Charset.forName("Shift_JIS"))
-    val output = String(process.inputStream.readAllBytes(), Charset.forName("Shift_JIS"))
-    process.destroy()
+    val isTle = !process.waitFor(runningTimeOutMilli, TimeUnit.MILLISECONDS)
+    val runTime = System.nanoTime() - startTime
+    process.destroyForcibly()
+    val errorOutput = String(process.errorStream.readBytes(), Charset.forName("Shift_JIS"))
+    val output = String(process.inputStream.readBytes(), Charset.forName("Shift_JIS"))
 
 
     val out = output.replace('\r', ' ').replace('\n', ' ')
@@ -507,7 +514,7 @@ fun codeTest(infoForJudge: InfoForJudge, testCase: TestCase, runningTimeOutMilli
     val isCompileError = infoForJudge.compileResult.isLeft()
 
     val stat = when {
-        infoForJudge.taskName == "unknown" -> Judge.Unknown
+        isTle -> Judge.TLE
         isCompileError -> Judge.CE
         runningError -> Judge.RE
         !pass -> Judge.WA
@@ -522,7 +529,8 @@ fun codeTest(infoForJudge: InfoForJudge, testCase: TestCase, runningTimeOutMilli
         stat,
         infoForJudge,
         testCase,
-        command
+        command,
+        runTime
     )
 }
 
@@ -532,7 +540,7 @@ fun determineTaskNumberAndPackageName(
     config: Config,
     file: File,
     charset: Charset
-): Pair<String, String?> {
+): Pair<String?, String?> {
     var taskName: String? = null
     var packageName: String? = null
     for(line in file.readLines(charset)) {
@@ -550,7 +558,7 @@ fun determineTaskNumberAndPackageName(
         if(packageName != null && taskName != null)
             return taskName to packageName
     }
-    return (taskName ?: "unknown") to (packageName)
+    return taskName to (packageName)
 }
 
 fun getAllTargetDirectories(path: String): List<File> {
@@ -610,7 +618,8 @@ fun compileJavaSource(
             """javac -J-Duser.language=en -d "${dstDirectory.absolutePathString()}" -encoding $encoding "${sourceFile.absolutePath}""""
         val process = runtime.exec(command)
         process.waitFor(compileTimeOutMilli, TimeUnit.MILLISECONDS)
-        val errorOutput = String(process.errorStream.readAllBytes())
+
+        val errorOutput = String(process.errorStream.readBytes())
         process.destroy()
         if(errorOutput.isEmpty()) {
             InternalCompileResult(
