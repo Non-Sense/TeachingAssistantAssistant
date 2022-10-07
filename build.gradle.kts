@@ -8,7 +8,7 @@ plugins {
 }
 
 group = "com.n0n5ense"
-version = "1.1-SNAPSHOT"
+version = "1.2-SNAPSHOT"
 
 repositories {
     mavenCentral()
@@ -19,6 +19,9 @@ dependencies {
     implementation("io.arrow-kt:arrow-core:1.1.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.4")
     implementation("com.charleskorn.kaml:kaml:0.49.0")
+    implementation("org.apache.poi:poi:5.2.2")
+    implementation("org.apache.poi:poi-ooxml:5.2.2")
+    implementation("org.apache.logging.log4j:log4j-core:2.19.0")
     testImplementation(kotlin("test"))
 }
 

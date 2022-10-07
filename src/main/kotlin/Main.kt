@@ -9,8 +9,16 @@ import kotlinx.cli.default
 import kotlinx.coroutines.*
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.Transient
+import org.apache.poi.ss.usermodel.*
+import org.apache.poi.ss.util.CellRangeAddress
+import org.apache.poi.xssf.usermodel.*
+import org.apache.xmlbeans.XmlObject
+import org.openxmlformats.schemas.spreadsheetml.x2006.main.CTCfRule
+import org.openxmlformats.schemas.spreadsheetml.x2006.main.CTDataBar
 import java.io.BufferedWriter
 import java.io.File
+import java.io.FileOutputStream
+import java.lang.reflect.Field
 import java.nio.charset.Charset
 import java.nio.file.Files
 import java.nio.file.Path
@@ -103,8 +111,7 @@ data class Task(
 data class Config(
     val compileTimeout: Long,
     val runningTimeout: Long,
-    val detailFileName: String = "detail.csv",
-    val summaryFileName: String = "summary.csv",
+    val outputFileName: String = "output",
     val tasks: Map<String, Task>
 )
 
@@ -124,7 +131,7 @@ suspend fun main(args: Array<String>) {
     val outputPath by parser.argument(
         ArgType.String,
         fullName = "outputDirectory",
-        description = "結果の出力先ディレクトリを指定する(csvが2つ生成される)。"
+        description = "結果の出力先ディレクトリを指定する。"
     )
     val nonKeepOriginalDirectory by parser.option(
         ArgType.Boolean,
@@ -132,12 +139,6 @@ suspend fun main(args: Array<String>) {
         shortName = "k",
         description = "コンパイル時に元のディレクトリ構成を維持しないでコンパイルする(packageが使えなくなる)"
     )
-    val outputWithSJIS by parser.option(
-        ArgType.Boolean,
-        fullName = "outputWithSJIS",
-        shortName = "s",
-        description = "結果ファイルをShift_JISで出力する"
-    ).default(false)
     val stepLevelArg by parser.option(
         ArgType.Int,
         fullName = "stepLevel",
@@ -155,6 +156,18 @@ suspend fun main(args: Array<String>) {
         fullName = "manualJudge",
         shortName = "m",
         description = "手動で判定する。"
+    ).default(false)
+    val outputToCsv by parser.option(
+        ArgType.Boolean,
+        fullName = "outputToCsv",
+        shortName = "c",
+        description = "結果ファイルをcsvに出力する。"
+    ).default(false)
+    val outputWithSJIS by parser.option(
+        ArgType.Boolean,
+        fullName = "outputWithSJIS",
+        shortName = "s",
+        description = "csvの結果ファイルをShift_JISで出力する"
     ).default(false)
 
     parser.parse(args)
@@ -210,30 +223,43 @@ suspend fun main(args: Array<String>) {
     println()
 
 
-    val outFile = Path(outputPath).resolve(config.detailFileName).toFile()
     val resultTable = makeResultTable(testResults)
-    runCatching {
-        outFile.bufferedWriter(outputCharset)
-    }.getOrElse {
-        println("結果詳細ファイルのオープンに失敗しました")
-        println("ファイルがロックされている可能性があります")
-        return
-    }.use {
-        writeDetail(it, testResults, workspacePath, resultTable, studentNameTable)
+    if(outputToCsv){
+        val outFile = Path(outputPath).resolve(config.outputFileName+"-detail.csv").toFile()
+        runCatching {
+            outFile.bufferedWriter(outputCharset)
+        }.getOrElse {
+            println("結果詳細ファイルのオープンに失敗しました")
+            println("ファイルがロックされている可能性があります")
+            return
+        }.use {
+            writeDetail(it, testResults, workspacePath, resultTable, studentNameTable)
+        }
+        val summaryFile = Path(outputPath).resolve(config.outputFileName+"-summary.csv").toFile()
+        runCatching {
+            summaryFile.bufferedWriter(outputCharset)
+        }.getOrElse {
+            println("結果概要ファイルのオープンに失敗しました")
+            println("ファイルがロックされている可能性があります")
+            return
+        }.use {
+            writeSummary(config.tasks, it, resultTable, studentNameTable)
+        }
+        println("result file wrote to  ${outFile.absolutePath}")
+        println("summary file wrote to ${summaryFile.absolutePath}")
+    } else {
+        val outFile = Path(outputPath).resolve(config.outputFileName.plus(".xlsx")).toFile()
+        runCatching {
+            outFile.outputStream()
+        }.getOrElse {
+            println("結果詳細ファイルのオープンに失敗しました")
+            println("ファイルがロックされている可能性があります")
+            return
+        }.use {
+            writeDetailAndSummaryExcel(it, testResults, workspacePath, resultTable, studentNameTable, config.tasks)
+        }
+        println("result file wrote to ${outFile.absolutePath}")
     }
-
-    val summaryFile = Path(outputPath).resolve(config.summaryFileName).toFile()
-    runCatching {
-        summaryFile.bufferedWriter(outputCharset)
-    }.getOrElse {
-        println("結果概要ファイルのオープンに失敗しました")
-        println("ファイルがロックされている可能性があります")
-        return
-    }.use {
-        writeSummary(config.tasks, it, resultTable, studentNameTable)
-    }
-
-    println("result file wrote to $outputPath")
 
 }
 
@@ -411,6 +437,255 @@ fun makeResultTable(testResults: List<TestResult>): Map<String, Map<String, Judg
     return resultTable
 }
 
+val detailHeader = listOf(
+    "studentID",
+    "studentName",
+    "sourcePath",
+    "taskName",
+    "testCase",
+    "arg",
+    "input",
+    "stat",
+    "time(ms)",
+    "expect",
+    "stdout",
+    "stderr",
+    "compileError",
+    "package",
+    "class",
+    "runCommand"
+)
+
+fun writeDetailAndSummaryExcel(
+    outputFileStream: FileOutputStream,
+    testResults: List<TestResult>,
+    workspacePath: Path,
+    resultTable: Map<String, Map<String, Judge>>,
+    studentNameTable: Map<String, String>,
+    tasks: Map<String, Task>
+) {
+    WorkbookFactory.create(true).let { it as XSSFWorkbook }.use { workBook ->
+        val sheet = workBook.createSheet("Detail")
+        sheet.createRow(0).let { row ->
+            detailHeader.forEachIndexed { index, s ->
+                row.createCell(index, CellType.STRING).apply {
+                    setCellValue(s)
+                }
+            }
+        }
+        val dataFormat = workBook.createDataFormat()
+        val timeStyle = workBook.createCellStyle().apply {
+            setDataFormat(dataFormat.getFormat("#.000"))
+        }
+
+        testResults.forEachIndexed { index, result ->
+            val studentId = result.judgeInfo.studentID
+            val studentName = studentNameTable[result.judgeInfo.studentID] ?: ""
+            val sourcePath =
+                result.judgeInfo.javaSource.absolutePath.removeRange(0..workspacePath.absolutePathString().length)
+            val packageName = result.judgeInfo.packageName ?: ""
+            val className = result.judgeInfo.className ?: ""
+            val taskName = result.judgeInfo.taskName ?: ""
+            val compileError = result.judgeInfo.compileResult.fold({ it }, { "" }).trimEnd().replace(',', ' ').escaped()
+            val command = result.command
+            val arg = result.testCase.arg
+            val input = result.testCase.input.joinToString("\n").escaped()
+            val expect = result.testCase.expect.joinToString("\n").escaped()
+            val output = result.output.trimEnd().escaped()
+            val errorOutput = result.errorOutput.trimEnd().escaped()
+            val testCaseName = result.testCase.name
+            val time = result.runTimeNano?.let { it/1000000f }
+            val stat =
+                if(result.judgeInfo.taskName == null) Judge.NF.toString() else resultTable[studentId]?.get("$taskName:$testCaseName")
+                    ?.toString() ?: "__"
+            sheet.createRow(index + 1).let { row ->
+                row.createCell(0, CellType.STRING).setCellValue(studentId)
+                row.createCell(1, CellType.STRING).setCellValue(studentName)
+                row.createCell(2, CellType.STRING).setCellValue(sourcePath)
+                row.createCell(3, CellType.STRING).setCellValue(taskName)
+                row.createCell(4, CellType.STRING).setCellValue(testCaseName)
+                row.createCell(5, CellType.STRING).setCellValue(arg)
+                row.createCell(6, CellType.STRING).setCellValue(input)
+                row.createCell(7, CellType.STRING).setCellValue(stat)
+                if(time == null) {
+                    row.createCell(8, CellType.BLANK).setBlank()
+                } else {
+                    row.createCell(8, CellType.NUMERIC).apply {
+                        setCellValue(time.toDouble())
+                        this.cellStyle = timeStyle
+                    }
+                }
+                row.createCell(9, CellType.STRING).setCellValue(expect)
+                row.createCell(10, CellType.STRING).setCellValue(output)
+                row.createCell(11, CellType.STRING).setCellValue(errorOutput)
+                row.createCell(12, CellType.STRING).setCellValue(compileError)
+                row.createCell(13, CellType.STRING).setCellValue(packageName)
+                row.createCell(14, CellType.STRING).setCellValue(className)
+                row.createCell(15, CellType.STRING).setCellValue(command)
+            }
+        }
+
+        val summarySheet = workBook.createSheet("Summary")
+        val taskNames = tasks.mapValues {
+            it.value.testcase.size
+        }
+        val taskNameList = tasks.flatMap {
+            (it.value.testcase).map { testCase ->
+                "${it.key}:${testCase.name}"
+            }
+        }
+        val nl = taskNames.map { "${it.key}%" }
+        summarySheet.createRow(0).let { row ->
+            detailHeader.forEachIndexed { index, s ->
+                row.createCell(index, CellType.STRING).apply {
+                    setCellValue(s)
+                }
+            }
+            row.createCell(0, CellType.STRING).setCellValue("ID")
+            row.createCell(1, CellType.STRING).setCellValue("Name")
+            nl.forEachIndexed { index, s ->
+                row.createCell(index + 2, CellType.STRING).setCellValue(s)
+            }
+            taskNameList.forEachIndexed { index, s ->
+                row.createCell(index + 2 + nl.size, CellType.STRING).setCellValue(s)
+            }
+        }
+        var count = 1
+        for(row in resultTable) {
+            val studentID = row.key
+            val studentName = studentNameTable[studentID] ?: ""
+            val data = row.value
+            val stats = taskNameList.map {
+                data[it] ?: data[it.takeWhile { c -> c != ':' }.plus(':')] ?: data["unknown:"] ?: Judge.NF
+            }
+
+            val ll = taskNames.mapValues { n ->
+                taskNameList.filter { it.startsWith(n.key) }.count { data[it] == Judge.AC } to n.value
+            }.map { (it.value.first.toFloat()/it.value.second.toFloat()*100f).toInt() }
+            summarySheet.createRow(count).apply {
+                createCell(0, CellType.STRING).setCellValue(studentID)
+                createCell(1, CellType.STRING).setCellValue(studentName)
+                ll.forEachIndexed { index, i ->
+                    createCell(index + 2, CellType.NUMERIC).setCellValue(i.toDouble())
+                }
+                stats.forEachIndexed { index, judge ->
+                    createCell(index + 2 + ll.size, CellType.STRING).setCellValue(judge.toString())
+                }
+            }
+            count += 1
+        }
+
+        fun SheetConditionalFormatting.create(
+            judge: Judge,
+            background: Color,
+            fontColor: Color,
+        ): ConditionalFormattingRule {
+            return createConditionalFormattingRule("""EXACT("$judge",INDIRECT(ADDRESS(ROW(),COLUMN())))""").apply {
+                createPatternFormatting().apply {
+                    setFillBackgroundColor(background)
+                    fillPattern = PatternFormatting.SOLID_FOREGROUND
+                }
+                createFontFormatting().fontColor = fontColor
+            }
+        }
+
+        fun XSSFColor(r: Int, g: Int, b: Int): XSSFColor {
+            return XSSFColor(byteArrayOf(r.toByte(), g.toByte(), b.toByte()))
+        }
+
+        fun XSSFSheet.setStatCond(range: CellRangeAddress) {
+            val sheetCF = sheetConditionalFormatting
+            listOf(
+                sheetCF.create(Judge.AC, XSSFColor(198, 239, 206), XSSFColor(0, 97, 0)),
+                sheetCF.create(Judge.WA, XSSFColor(255, 235, 156), XSSFColor(156, 87, 0)),
+                sheetCF.create(Judge.TLE, XSSFColor(255, 235, 156), XSSFColor(156, 87, 0)),
+                sheetCF.create(Judge.RE, XSSFColor(255, 199, 206), XSSFColor(156, 0, 6)),
+                sheetCF.create(Judge.CE, XSSFColor(255, 199, 206), XSSFColor(156, 0, 6)),
+                sheetCF.create(Judge.IE, XSSFColor(255, 255, 255), XSSFColor(0, 0, 0)),
+                sheetCF.create(Judge.NF, XSSFColor(191, 191, 191), XSSFColor(0, 0, 0))
+            ).forEach {
+                sheetCF.addConditionalFormatting(arrayOf(range), it)
+            }
+
+        }
+
+        sheet.setStatCond(CellRangeAddress(1, testResults.size, 7, 7))
+        sheet.setAutoFilter(CellRangeAddress(0, 0, 0, detailHeader.size))
+        detailHeader.indices.forEach { sheet.autoSizeColumn(it) }
+
+        val summaryLastCol = taskNames.size + 1 + taskNameList.size
+        summarySheet.setStatCond(
+            CellRangeAddress(1, resultTable.size, taskNames.size + 2, summaryLastCol)
+        )
+        summarySheet.setAutoFilter(CellRangeAddress(0, 0, 0, summaryLastCol))
+        val color = workBook.creationHelper.createExtendedColor().apply {
+            this.rgb = byteArrayOf(99,142.toByte(),198.toByte())
+        }
+        applyDataBars(summarySheet.sheetConditionalFormatting,CellRangeAddress(1,resultTable.size,2,taskNames.size+1),color)
+        workBook.write(outputFileStream)
+    }
+}
+
+@Throws(Exception::class)
+fun applyDataBars(sheetCF: SheetConditionalFormatting, region: CellRangeAddress, color: ExtendedColor?) {
+    val regions = arrayOf(region)
+    val rule = sheetCF.createConditionalFormattingRule(color)
+    val dbf = rule.dataBarFormatting
+    dbf.minThreshold.rangeType = ConditionalFormattingThreshold.RangeType.NUMBER
+    dbf.minThreshold.value = 0.0
+    dbf.maxThreshold.rangeType = ConditionalFormattingThreshold.RangeType.NUMBER
+    dbf.maxThreshold.value = 100.0
+    dbf.isIconOnly = false
+    dbf.widthMin =
+        0 //cannot work for XSSFDataBarFormatting, see https://svn.apache.org/viewvc/poi/tags/REL_4_0_1/src/ooxml/java/org/apache/poi/xssf/usermodel/XSSFDataBarFormatting.java?view=markup#l57
+    dbf.widthMax =
+        100 //cannot work for XSSFDataBarFormatting, see https://svn.apache.org/viewvc/poi/tags/REL_4_0_1/src/ooxml/java/org/apache/poi/xssf/usermodel/XSSFDataBarFormatting.java?view=markup#l64
+    if(dbf is XSSFDataBarFormatting) {
+        val databar: Field = XSSFDataBarFormatting::class.java.getDeclaredField("_databar")
+        databar.isAccessible = true
+        val ctDataBar = databar.get(dbf) as CTDataBar
+        ctDataBar.minLength = 0
+        ctDataBar.maxLength = 100
+    }
+
+    // use extension from x14 namespace to set data bars not using gradient color
+    if(rule is XSSFConditionalFormattingRule) {
+        val cfRule: Field = XSSFConditionalFormattingRule::class.java.getDeclaredField("_cfRule")
+        cfRule.isAccessible = true
+        val ctRule = cfRule.get(rule) as CTCfRule
+        var extList = ctRule.addNewExtLst()
+        var ext = extList.addNewExt()
+        var extXML = ("<x14:id"
+                + " xmlns:x14=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\">"
+                + "{00000000-000E-0000-0000-000001000000}"
+                + "</x14:id>")
+        var xlmObject = XmlObject.Factory.parse(extXML)
+        ext.set(xlmObject)
+        ext.uri = "{B025F937-C7B1-47D3-B67F-A62EFF666E3E}"
+        val _sh: Field = XSSFConditionalFormattingRule::class.java.getDeclaredField("_sh")
+        _sh.setAccessible(true)
+        val sheet = _sh.get(rule) as XSSFSheet
+        extList = sheet.ctWorksheet.addNewExtLst()
+        ext = extList.addNewExt()
+        extXML =
+            ("<x14:conditionalFormattings xmlns:x14=\"http://schemas.microsoft.com/office/spreadsheetml/2009/9/main\">"
+                    + "<x14:conditionalFormatting xmlns:xm=\"http://schemas.microsoft.com/office/excel/2006/main\">"
+                    + "<x14:cfRule type=\"dataBar\" id=\"{00000000-000E-0000-0000-000001000000}\">"
+                    + "<x14:dataBar minLength=\"" + 0 + "\" maxLength=\"" + 100 + "\" gradient=\"" + false + "\">"
+                    + "<x14:cfvo type=\"num\"><xm:f>" + 0 + "</xm:f></x14:cfvo>"
+                    + "<x14:cfvo type=\"num\"><xm:f>" + 100 + "</xm:f></x14:cfvo>"
+                    + "</x14:dataBar>"
+                    + "</x14:cfRule>"
+                    + "<xm:sqref>" + region.formatAsString() + "</xm:sqref>"
+                    + "</x14:conditionalFormatting>"
+                    + "</x14:conditionalFormattings>")
+        xlmObject = XmlObject.Factory.parse(extXML)
+        ext.set(xlmObject)
+        ext.uri = "{78C0D931-6437-407d-A8EE-F0AAD7539E65}"
+    }
+    sheetCF.addConditionalFormatting(regions, rule)
+}
+
 fun writeDetail(
     outputStream: BufferedWriter,
     testResults: List<TestResult>,
@@ -418,7 +693,7 @@ fun writeDetail(
     resultTable: Map<String, Map<String, Judge>>,
     studentNameTable: Map<String, String>
 ) {
-    outputStream.appendLine("studentID,studentName,sourcePath,taskName,testCase,arg,input,stat,time(ms),expect,output,errorOutput,compileErrorOutput,package,class,runCommand")
+    outputStream.appendLine(detailHeader.joinToString(","))
     for(result in testResults) {
 
         val studentId = result.judgeInfo.studentID
@@ -438,7 +713,9 @@ fun writeDetail(
         val testCaseName = result.testCase.name
         val time = result.runTimeNano?.let { String.format("%.3f", it/1000000f) } ?: ""
 
-        val stat = resultTable[studentId]?.get("$taskName:$testCaseName") ?: "__"
+        val stat =
+            if(result.judgeInfo.taskName == null) Judge.NF.toString() else resultTable[studentId]?.get("$taskName:$testCaseName")
+                ?.toString() ?: "__"
 
         outputStream.appendLine(
             """$studentId,$studentName,$sourcePath,$taskName,$testCaseName,$arg,$input,$stat,$time,$expect,$output,$errorOutput,$compileError,$packageName,$className,$command"""
