@@ -61,7 +61,7 @@ enum class Judge(private val displayName: String) {
 }
 
 data class CompileResult(
-    val result: Either<String, String>,
+    val result: Either<CompileError, String>,
     val encoding: Encoding,
     val javaSource: File,
     val studentBase: File,
@@ -71,7 +71,7 @@ data class CompileResult(
 
 data class InfoForJudge(
     val studentID: String,
-    val taskName: String?,
+    val taskName: TaskName?,
     val classFileDir: Path,
     val className: String?,
     val packageName: String?,
@@ -112,7 +112,27 @@ data class Config(
     val compileTimeout: Long,
     val runningTimeout: Long,
     val outputFileName: String = "output",
-    val tasks: Map<String, Task>
+    val tasks: Map<TaskName, Task>
+)
+
+@Serializable
+@JvmInline
+value class TaskName(
+    val name: String
+) {
+    override fun toString(): String {
+        return name
+    }
+}
+
+@JvmInline
+value class PackageName(
+    val name: String
+)
+
+@JvmInline
+value class CompileError(
+    val message: String
 )
 
 
@@ -364,17 +384,19 @@ suspend fun runTests(
         }
     }
 
-    val judgeInfo = compileResults.map {
+    val judgeInfo = compileResults.flatMap {
         val t = determineTaskNumberAndPackageName(config, it.javaSource, it.encoding.charset)
-        InfoForJudge(
-            studentID = it.studentBase.name,
-            taskName = t.first,
-            classFileDir = it.dstDirectory,
-            className = it.result.orNull(),
-            packageName = t.second,
-            compileResult = it.result,
-            javaSource = it.javaSource
-        )
+        t.first.map { task ->
+            InfoForJudge(
+                studentID = it.studentBase.name,
+                taskName = task,
+                classFileDir = it.dstDirectory,
+                className = it.result.orNull(),
+                packageName = t.second,
+                compileResult = it.result,
+                javaSource = it.javaSource
+            )
+        }
     }
 
 
@@ -456,13 +478,81 @@ val detailHeader = listOf(
     "runCommand"
 )
 
+class DetailRow(
+    result: TestResult,
+    studentNameTable: Map<String, String>,
+    workspacePath: Path,
+    resultTable: Map<String, Map<String, Judge>>
+) {
+    val studentId = result.judgeInfo.studentID
+    val studentName = studentNameTable[result.judgeInfo.studentID] ?: ""
+    val sourcePath = result.judgeInfo.javaSource.absolutePath.removeRange(0..workspacePath.absolutePathString().length)
+    val packageName = result.judgeInfo.packageName ?: ""
+    val className = result.judgeInfo.className ?: ""
+    val taskName = result.judgeInfo.taskName ?: TaskName("")
+    val compileError = result.judgeInfo.compileResult.fold({ it }, { "" }).trimEnd().replace(',', ' ').escaped()
+    val command = result.command
+    val arg = result.testCase.arg
+    val input = result.testCase.input.joinToString("\n").escaped()
+    val expect = result.testCase.expect.joinToString("\n").escaped()
+    val output = result.output.trimEnd().escaped()
+    val errorOutput = result.errorOutput.trimEnd().escaped()
+    val testCaseName = result.testCase.name
+    val time = result.runTimeNano?.let { it/1000000f }
+    val stat =
+        if(result.judgeInfo.taskName == null) Judge.NF.toString() else resultTable[studentId]?.get("$taskName:$testCaseName")
+            ?.toString() ?: "__"
+
+    fun getCsvString(): String {
+        return """$studentId,$studentName,$sourcePath,$taskName,$testCaseName,$arg,$input,$stat,$time,$expect,$output,$errorOutput,$compileError,$packageName,$className,$command"""
+    }
+}
+
+class SummaryHeader(
+    tasks: Map<TaskName, Task>
+) {
+    val taskNames = tasks.mapValues {
+        it.value.testcase.size
+    }
+    val testCaseList = tasks.flatMap {
+        (it.value.testcase).map { testCase ->
+            "${it.key}:${testCase.name}"
+        }
+    }
+    val headers: List<String> = mutableListOf<String>().apply {
+        add("ID")
+        add("Name")
+        addAll(taskNames.map { it.key.name })
+        addAll(testCaseList)
+    }
+}
+
+class SummaryRow(
+    result: Map.Entry<String, Map<String, Judge>>,
+    studentNameTable: Map<String, String>,
+    summaryHeader: SummaryHeader
+) {
+    val studentID = result.key
+    val studentName = studentNameTable[studentID] ?: ""
+    private val data = result.value
+    val stats = summaryHeader.testCaseList.map {
+        data[it] ?: data[it.takeWhile { c -> c != ':' }.plus(':')] ?: data["unknown:"] ?: Judge.NF
+    }
+    val acceptRatio = summaryHeader.taskNames.mapValues { n ->
+        summaryHeader.testCaseList.filter { it.startsWith(n.key.name) }.count { data[it] == Judge.AC } to n.value
+    }.map { (it.value.first.toFloat()/it.value.second.toFloat()*100f).toInt().toString() }
+    fun getCsvString(): String {
+        return """$studentID,$studentName,${acceptRatio.joinToString()},${stats.joinToString()}"""
+    }
+}
+
 fun writeDetailAndSummaryExcel(
     outputFileStream: FileOutputStream,
     testResults: List<TestResult>,
     workspacePath: Path,
     resultTable: Map<String, Map<String, Judge>>,
     studentNameTable: Map<String, String>,
-    tasks: Map<String, Task>
+    tasks: Map<TaskName, Task>
 ) {
     WorkbookFactory.create(true).let { it as XSSFWorkbook }.use { workBook ->
         val sheet = workBook.createSheet("Detail")
@@ -479,97 +569,53 @@ fun writeDetailAndSummaryExcel(
         }
 
         testResults.forEachIndexed { index, result ->
-            val studentId = result.judgeInfo.studentID
-            val studentName = studentNameTable[result.judgeInfo.studentID] ?: ""
-            val sourcePath =
-                result.judgeInfo.javaSource.absolutePath.removeRange(0..workspacePath.absolutePathString().length)
-            val packageName = result.judgeInfo.packageName ?: ""
-            val className = result.judgeInfo.className ?: ""
-            val taskName = result.judgeInfo.taskName ?: ""
-            val compileError = result.judgeInfo.compileResult.fold({ it }, { "" }).trimEnd().replace(',', ' ').escaped()
-            val command = result.command
-            val arg = result.testCase.arg
-            val input = result.testCase.input.joinToString("\n").escaped()
-            val expect = result.testCase.expect.joinToString("\n").escaped()
-            val output = result.output.trimEnd().escaped()
-            val errorOutput = result.errorOutput.trimEnd().escaped()
-            val testCaseName = result.testCase.name
-            val time = result.runTimeNano?.let { it/1000000f }
-            val stat =
-                if(result.judgeInfo.taskName == null) Judge.NF.toString() else resultTable[studentId]?.get("$taskName:$testCaseName")
-                    ?.toString() ?: "__"
+            val detailRow = DetailRow(result, studentNameTable, workspacePath, resultTable)
             sheet.createRow(index + 1).let { row ->
-                row.createCell(0, CellType.STRING).setCellValue(studentId)
-                row.createCell(1, CellType.STRING).setCellValue(studentName)
-                row.createCell(2, CellType.STRING).setCellValue(sourcePath)
-                row.createCell(3, CellType.STRING).setCellValue(taskName)
-                row.createCell(4, CellType.STRING).setCellValue(testCaseName)
-                row.createCell(5, CellType.STRING).setCellValue(arg)
-                row.createCell(6, CellType.STRING).setCellValue(input)
-                row.createCell(7, CellType.STRING).setCellValue(stat)
-                if(time == null) {
+                row.createCell(0, CellType.STRING).setCellValue(detailRow.studentId)
+                row.createCell(1, CellType.STRING).setCellValue(detailRow.studentName)
+                row.createCell(2, CellType.STRING).setCellValue(detailRow.sourcePath)
+                row.createCell(3, CellType.STRING).setCellValue(detailRow.taskName.name)
+                row.createCell(4, CellType.STRING).setCellValue(detailRow.testCaseName)
+                row.createCell(5, CellType.STRING).setCellValue(detailRow.arg)
+                row.createCell(6, CellType.STRING).setCellValue(detailRow.input)
+                row.createCell(7, CellType.STRING).setCellValue(detailRow.stat)
+                if(detailRow.time == null) {
                     row.createCell(8, CellType.BLANK).setBlank()
                 } else {
                     row.createCell(8, CellType.NUMERIC).apply {
-                        setCellValue(time.toDouble())
+                        setCellValue(detailRow.time.toDouble())
                         this.cellStyle = timeStyle
                     }
                 }
-                row.createCell(9, CellType.STRING).setCellValue(expect)
-                row.createCell(10, CellType.STRING).setCellValue(output)
-                row.createCell(11, CellType.STRING).setCellValue(errorOutput)
-                row.createCell(12, CellType.STRING).setCellValue(compileError)
-                row.createCell(13, CellType.STRING).setCellValue(packageName)
-                row.createCell(14, CellType.STRING).setCellValue(className)
-                row.createCell(15, CellType.STRING).setCellValue(command)
+                row.createCell(9, CellType.STRING).setCellValue(detailRow.expect)
+                row.createCell(10, CellType.STRING).setCellValue(detailRow.output)
+                row.createCell(11, CellType.STRING).setCellValue(detailRow.errorOutput)
+                row.createCell(12, CellType.STRING).setCellValue(detailRow.compileError)
+                row.createCell(13, CellType.STRING).setCellValue(detailRow.packageName)
+                row.createCell(14, CellType.STRING).setCellValue(detailRow.className)
+                row.createCell(15, CellType.STRING).setCellValue(detailRow.command)
             }
         }
 
         val summarySheet = workBook.createSheet("Summary")
-        val taskNames = tasks.mapValues {
-            it.value.testcase.size
-        }
-        val taskNameList = tasks.flatMap {
-            (it.value.testcase).map { testCase ->
-                "${it.key}:${testCase.name}"
-            }
-        }
-        val nl = taskNames.map { "${it.key}%" }
+        val summaryHeader = SummaryHeader(tasks)
+
         summarySheet.createRow(0).let { row ->
-            detailHeader.forEachIndexed { index, s ->
-                row.createCell(index, CellType.STRING).apply {
-                    setCellValue(s)
-                }
-            }
-            row.createCell(0, CellType.STRING).setCellValue("ID")
-            row.createCell(1, CellType.STRING).setCellValue("Name")
-            nl.forEachIndexed { index, s ->
-                row.createCell(index + 2, CellType.STRING).setCellValue(s)
-            }
-            taskNameList.forEachIndexed { index, s ->
-                row.createCell(index + 2 + nl.size, CellType.STRING).setCellValue(s)
+            summaryHeader.headers.forEachIndexed { index, s ->
+                row.createCell(index, CellType.STRING).setCellValue(s)
             }
         }
         var count = 1
         for(row in resultTable) {
-            val studentID = row.key
-            val studentName = studentNameTable[studentID] ?: ""
-            val data = row.value
-            val stats = taskNameList.map {
-                data[it] ?: data[it.takeWhile { c -> c != ':' }.plus(':')] ?: data["unknown:"] ?: Judge.NF
-            }
-
-            val ll = taskNames.mapValues { n ->
-                taskNameList.filter { it.startsWith(n.key) }.count { data[it] == Judge.AC } to n.value
-            }.map { (it.value.first.toFloat()/it.value.second.toFloat()*100f).toInt() }
+            val summaryRow = SummaryRow(row, studentNameTable, summaryHeader)
             summarySheet.createRow(count).apply {
-                createCell(0, CellType.STRING).setCellValue(studentID)
-                createCell(1, CellType.STRING).setCellValue(studentName)
-                ll.forEachIndexed { index, i ->
+                createCell(0, CellType.STRING).setCellValue(summaryRow.studentID)
+                createCell(1, CellType.STRING).setCellValue(summaryRow.studentName)
+                summaryRow.acceptRatio.forEachIndexed { index, i ->
                     createCell(index + 2, CellType.NUMERIC).setCellValue(i.toDouble())
                 }
-                stats.forEachIndexed { index, judge ->
-                    createCell(index + 2 + ll.size, CellType.STRING).setCellValue(judge.toString())
+                summaryRow.stats.forEachIndexed { index, judge ->
+                    createCell(index + 2 + summaryRow.acceptRatio.size, CellType.STRING).setCellValue(judge.toString())
                 }
             }
             count += 1
@@ -613,15 +659,15 @@ fun writeDetailAndSummaryExcel(
         sheet.setAutoFilter(CellRangeAddress(0, 0, 0, detailHeader.size))
         detailHeader.indices.forEach { sheet.autoSizeColumn(it) }
 
-        val summaryLastCol = taskNames.size + 1 + taskNameList.size
+        val summaryLastCol = summaryHeader.taskNames.size + 1 + summaryHeader.testCaseList.size
         summarySheet.setStatCond(
-            CellRangeAddress(1, resultTable.size, taskNames.size + 2, summaryLastCol)
+            CellRangeAddress(1, resultTable.size, summaryHeader.taskNames.size + 2, summaryLastCol)
         )
         summarySheet.setAutoFilter(CellRangeAddress(0, 0, 0, summaryLastCol))
         val color = workBook.creationHelper.createExtendedColor().apply {
             this.rgb = byteArrayOf(99,142.toByte(),198.toByte())
         }
-        applyDataBars(summarySheet.sheetConditionalFormatting,CellRangeAddress(1,resultTable.size,2,taskNames.size+1),color)
+        applyDataBars(summarySheet.sheetConditionalFormatting,CellRangeAddress(1,resultTable.size,2,summaryHeader.taskNames.size+1),color)
         workBook.write(outputFileStream)
     }
 }
@@ -695,62 +741,22 @@ fun writeDetail(
 ) {
     outputStream.appendLine(detailHeader.joinToString(","))
     for(result in testResults) {
-
-        val studentId = result.judgeInfo.studentID
-        val studentName = studentNameTable[result.judgeInfo.studentID] ?: ""
-        val sourcePath =
-            result.judgeInfo.javaSource.absolutePath.removeRange(0..workspacePath.absolutePathString().length)
-        val packageName = result.judgeInfo.packageName ?: ""
-        val className = result.judgeInfo.className ?: ""
-        val taskName = result.judgeInfo.taskName ?: ""
-        val compileError = result.judgeInfo.compileResult.fold({ it }, { "" }).trimEnd().replace(',', ' ').escaped()
-        val command = result.command
-        val arg = result.testCase.arg
-        val input = result.testCase.input.joinToString("\n").escaped()
-        val expect = result.testCase.expect.joinToString("\n").escaped()
-        val output = result.output.trimEnd().escaped()
-        val errorOutput = result.errorOutput.trimEnd().escaped()
-        val testCaseName = result.testCase.name
-        val time = result.runTimeNano?.let { String.format("%.3f", it/1000000f) } ?: ""
-
-        val stat =
-            if(result.judgeInfo.taskName == null) Judge.NF.toString() else resultTable[studentId]?.get("$taskName:$testCaseName")
-                ?.toString() ?: "__"
-
-        outputStream.appendLine(
-            """$studentId,$studentName,$sourcePath,$taskName,$testCaseName,$arg,$input,$stat,$time,$expect,$output,$errorOutput,$compileError,$packageName,$className,$command"""
-        )
+        val detailRow = DetailRow(result, studentNameTable, workspacePath, resultTable)
+        outputStream.appendLine(detailRow.getCsvString())
     }
 }
 
 fun writeSummary(
-    tasks: Map<String, Task>,
+    tasks: Map<TaskName, Task>,
     outputStream: BufferedWriter,
     resultTable: Map<String, Map<String, Judge>>,
     studentNameTable: Map<String, String>
 ) {
-    val taskNames = tasks.mapValues {
-        it.value.testcase.size
-    }
-    val taskNameList = tasks.flatMap {
-        (it.value.testcase).map { testCase ->
-            "${it.key}:${testCase.name}"
-        }
-    }
-    val nl = taskNames.map { "${it.key}%" }
-    outputStream.appendLine("""ID,Name,${nl.joinToString()},${taskNameList.joinToString()}""")
+    val summaryHeader = SummaryHeader(tasks)
+    outputStream.appendLine(summaryHeader.headers.joinToString())
     for(row in resultTable) {
-        val studentID = row.key
-        val studentName = studentNameTable[studentID] ?: ""
-        val data = row.value
-        val stats = taskNameList.map {
-            data[it] ?: data[it.takeWhile { c -> c != ':' }.plus(':')] ?: data["unknown:"] ?: Judge.NF
-        }
-
-        val ll = taskNames.mapValues { n ->
-            taskNameList.filter { it.startsWith(n.key) }.count { data[it] == Judge.AC } to n.value
-        }.map { (it.value.first.toFloat()/it.value.second.toFloat()*100f).toInt().toString() }
-        outputStream.appendLine("""$studentID,$studentName,${ll.joinToString()},${stats.joinToString()}""")
+        val summaryRow = SummaryRow(row, studentNameTable, summaryHeader)
+        outputStream.appendLine(summaryRow.getCsvString())
     }
 }
 
@@ -817,25 +823,23 @@ fun determineTaskNumberAndPackageName(
     config: Config,
     file: File,
     charset: Charset
-): Pair<String?, String?> {
-    var taskName: String? = null
+): Pair<List<TaskName>, String?> {
+    val taskNames = mutableListOf<TaskName>()
     var packageName: String? = null
     for(line in file.readLines(charset)) {
-        for(info in config.tasks) {
-            for(word in info.value.word) {
-                if(line.contains(word)) {
-                    taskName = info.key
-                    if(packageName != null)
-                        return taskName to packageName
-                }
+        for((taskName, task) in config.tasks) {
+            if(line.contains(task.word)) {
+                taskNames.add(taskName)
             }
         }
         val match = packageRegex.find(line) ?: continue
         packageName = match.groups[1]?.value
-        if(packageName != null && taskName != null)
-            return taskName to packageName
     }
-    return taskName to (packageName)
+    return taskNames to packageName
+}
+
+fun String.contains(strings: Collection<String>): Boolean {
+    return strings.firstOrNull { this.contains(it) } != null
 }
 
 fun getAllTargetDirectories(path: String): List<File> {
@@ -880,7 +884,7 @@ fun compileJavaSource(
     sourceFile: File,
     dstDirectory: Path,
     compileTimeOutMilli: Long
-): Pair<Either<String, String>, Encoding> {
+): Pair<Either<CompileError, String>, Encoding> {
 
     data class InternalCompileResult(
         val exitCode: Int,
@@ -931,11 +935,11 @@ fun compileJavaSource(
     val isNotUtf8 = utf8Result.map { it.errorMessage.contains("error: unmappable character") }.getOrDefault(false)
     val isNotSJis = sJisResult.map { it.errorMessage.contains("error: unmappable character") }.getOrDefault(false)
     if(isNotUtf8 && isNotSJis)
-        return "Unknown encoding".left() to Encoding.Unknown
+        return CompileError("Unknown encoding").left() to Encoding.Unknown
     if(isNotUtf8)
-        return sJisResult.fold({ it.errorMessage }, { it.message ?: "exception occurred" }).left() to Encoding.ShiftJIS
+        return CompileError(sJisResult.fold({ it.errorMessage }, { it.message ?: "exception occurred" })).left() to Encoding.ShiftJIS
     if(isNotSJis)
-        return utf8Result.fold({ it.errorMessage }, { it.message ?: "exception occurred" }).left() to Encoding.UTF8
+        return CompileError(utf8Result.fold({ it.errorMessage }, { it.message ?: "exception occurred" })).left() to Encoding.UTF8
     println("""ERROR: SJis:${sJisResult.fold({ it }, { it })}   utf8:${utf8Result.fold({ it }, { it })}""")
-    return "unreachable condition".left() to Encoding.Unknown
+    return CompileError("unreachable condition").left() to Encoding.Unknown
 }
