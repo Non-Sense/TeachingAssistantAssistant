@@ -27,6 +27,9 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.Path
 import kotlin.io.path.absolutePathString
 
+
+// TODO: REの条件をExceptionにする
+
 enum class Encoding(val charset: Charset) {
     UTF8(Charset.forName("UTF-8")),
     ShiftJIS(Charset.forName("Shift_JIS")),
@@ -70,12 +73,12 @@ data class CompileResult(
 )
 
 data class InfoForJudge(
-    val studentID: String,
+    val studentID: StudentID,
     val taskName: TaskName?,
     val classFileDir: Path,
     val className: String?,
-    val packageName: String?,
-    val compileResult: Either<String, String>,
+    val packageName: PackageName?,
+    val compileResult: Either<CompileError, String>,
     val javaSource: File
 )
 
@@ -85,7 +88,7 @@ data class TestResult(
     val exitCode: Int = -1,
     val judge: Judge = Judge.Unknown,
     val judgeInfo: InfoForJudge,
-    val testCase: TestCase = TestCase(""),
+    val testCase: TestCase? = null,
     val command: String = "",
     val runTimeNano: Long? = null
 )
@@ -134,6 +137,15 @@ value class PackageName(
 value class CompileError(
     val message: String
 )
+
+@JvmInline
+value class StudentID(
+    val id: String
+) {
+    override fun toString(): String {
+        return id
+    }
+}
 
 
 suspend fun main(args: Array<String>) {
@@ -244,8 +256,8 @@ suspend fun main(args: Array<String>) {
 
 
     val resultTable = makeResultTable(testResults)
-    if(outputToCsv){
-        val outFile = Path(outputPath).resolve(config.outputFileName+"-detail.csv").toFile()
+    if(outputToCsv) {
+        val outFile = Path(outputPath).resolve(config.outputFileName + "-detail.csv").toFile()
         runCatching {
             outFile.bufferedWriter(outputCharset)
         }.getOrElse {
@@ -255,7 +267,7 @@ suspend fun main(args: Array<String>) {
         }.use {
             writeDetail(it, testResults, workspacePath, resultTable, studentNameTable)
         }
-        val summaryFile = Path(outputPath).resolve(config.outputFileName+"-summary.csv").toFile()
+        val summaryFile = Path(outputPath).resolve(config.outputFileName + "-summary.csv").toFile()
         runCatching {
             summaryFile.bufferedWriter(outputCharset)
         }.getOrElse {
@@ -306,7 +318,7 @@ suspend fun compile(workspacePath: Path, config: Config, keepOriginalDirectory: 
         findJavaSourceFiles(base.toPath()).forEach { javaSource ->
             val dstPath = calcDstPath(keepOriginalDirectory, base, studentBase, javaSource)
             jobs.add(CoroutineScope(Dispatchers.Default).async {
-                val res = compileJavaSource(javaSource, dstPath, config.compileTimeout)
+                val res = compileJavaSource(javaSource, dstPath, config.compileTimeout, base.toPath())
                 printProgress(printProgress, counter.addAndGet(1), totalSize)
                 CompileResult(res.first, res.second, javaSource, studentBase, base, dstPath)
             })
@@ -388,7 +400,7 @@ suspend fun runTests(
         val t = determineTaskNumberAndPackageName(config, it.javaSource, it.encoding.charset)
         t.first.map { task ->
             InfoForJudge(
-                studentID = it.studentBase.name,
+                studentID = StudentID(it.studentBase.name),
                 taskName = task,
                 classFileDir = it.dstDirectory,
                 className = it.result.orNull(),
@@ -410,7 +422,7 @@ suspend fun runTests(
         val info = pair.second.first
         val testcase = pair.second.second
         if(testcase != null && info.className != null)
-            print("running: ${info.studentID}:${info.className}  \t${info.taskName}:${testcase.name}\t-> ")
+            print("running: ${info.studentID.id}:${info.className}  \t${info.taskName}:${testcase.name}\t-> ")
         if(!manualJudge || (testcase == null || info.className == null)) {
             return job.await().also { r ->
                 if(testcase != null && info.className != null)
@@ -443,18 +455,38 @@ suspend fun runTests(
     }
 }
 
-fun makeResultTable(testResults: List<TestResult>): Map<String, Map<String, Judge>> {
-    val resultTable = mutableMapOf<String, MutableMap<String, Judge>>()
+class TestResultTable {
+    private val table = mutableMapOf<StudentID, MutableMap<Pair<TaskName?, TestCase?>, Judge>>()
+    fun size() = table.size
+    fun add(studentID: StudentID, taskName: TaskName?, testCase: TestCase?, stat: Judge) {
+        table.computeIfAbsent(studentID) {
+            mutableMapOf()
+        }[taskName to testCase] = stat // REVIEW: 合ってるかわからん
+    }
+
+    fun getByStudentID(studentID: StudentID): Map<Pair<TaskName?, TestCase?>, Judge>? {
+        return table[studentID]
+    }
+
+    fun get(studentID: StudentID, taskName: TaskName?, testCase: TestCase?): Judge? {
+        return table[studentID]?.get(taskName to testCase)
+    }
+
+    operator fun iterator(): Iterator<Map.Entry<StudentID, Map<Pair<TaskName?, TestCase?>, Judge>>> {
+        return table.iterator()
+    }
+}
+
+fun makeResultTable(testResults: List<TestResult>): TestResultTable {
+    val resultTable = TestResultTable()
     for(result in testResults) {
 
         val studentId = result.judgeInfo.studentID
         val taskName = result.judgeInfo.taskName
-        val testCaseName = result.testCase.name
+        val testCase = result.testCase
         val stat = result.judge
 
-        resultTable.computeIfAbsent(studentId) {
-            mutableMapOf()
-        }["$taskName:$testCaseName"] = stat
+        resultTable.add(studentId, taskName, testCase, stat)
     }
     return resultTable
 }
@@ -478,33 +510,43 @@ val detailHeader = listOf(
     "runCommand"
 )
 
+fun String.removeCarriageReturn(): String {
+    return this.replace("\r", "")
+}
+
+fun String.csvFormat(): String {
+    return this.replace(',', ' ').escaped()
+}
+
 class DetailRow(
     result: TestResult,
-    studentNameTable: Map<String, String>,
+    studentNameTable: Map<StudentID, String>,
     workspacePath: Path,
-    resultTable: Map<String, Map<String, Judge>>
+    resultTable: TestResultTable
 ) {
-    val studentId = result.judgeInfo.studentID
+    val studentId = result.judgeInfo.studentID.id
     val studentName = studentNameTable[result.judgeInfo.studentID] ?: ""
     val sourcePath = result.judgeInfo.javaSource.absolutePath.removeRange(0..workspacePath.absolutePathString().length)
-    val packageName = result.judgeInfo.packageName ?: ""
+    val packageName = result.judgeInfo.packageName?.name ?: ""
     val className = result.judgeInfo.className ?: ""
     val taskName = result.judgeInfo.taskName ?: TaskName("")
-    val compileError = result.judgeInfo.compileResult.fold({ it }, { "" }).trimEnd().replace(',', ' ').escaped()
+    val compileError = result.judgeInfo.compileResult.fold({ it.message }, { "" }).removeCarriageReturn()
     val command = result.command
-    val arg = result.testCase.arg
-    val input = result.testCase.input.joinToString("\n").escaped()
-    val expect = result.testCase.expect.joinToString("\n").escaped()
-    val output = result.output.trimEnd().escaped()
-    val errorOutput = result.errorOutput.trimEnd().escaped()
-    val testCaseName = result.testCase.name
+    val arg = result.testCase?.arg ?: ""
+    val input = result.testCase?.input?.joinToString("\n")?.removeCarriageReturn() ?: ""
+    val expect = result.testCase?.expect?.joinToString("\n")?.removeCarriageReturn() ?: ""
+    val output = result.output.trimEnd().removeCarriageReturn()
+    val errorOutput = result.errorOutput.trimEnd().removeCarriageReturn()
+    val testCaseName = result.testCase?.name ?: ""
     val time = result.runTimeNano?.let { it/1000000f }
-    val stat =
-        if(result.judgeInfo.taskName == null) Judge.NF.toString() else resultTable[studentId]?.get("$taskName:$testCaseName")
-            ?.toString() ?: "__"
+    val stat = if(result.judgeInfo.taskName == null) Judge.NF.toString() else resultTable.get(
+        result.judgeInfo.studentID,
+        taskName,
+        result.testCase
+    )?.toString() ?: "__"
 
     fun getCsvString(): String {
-        return """$studentId,$studentName,$sourcePath,$taskName,$testCaseName,$arg,$input,$stat,$time,$expect,$output,$errorOutput,$compileError,$packageName,$className,$command"""
+        return """$studentId,$studentName,$sourcePath,$taskName,$testCaseName,$arg,${input.csvFormat()},$stat,$time,${expect.csvFormat()},${output.csvFormat()},${errorOutput.csvFormat()},${compileError.csvFormat()},$packageName,$className,$command"""
     }
 }
 
@@ -517,30 +559,33 @@ class SummaryHeader(
     val testCaseList = tasks.flatMap {
         (it.value.testcase).map { testCase ->
             "${it.key}:${testCase.name}"
+            it.key to testCase
         }
     }
     val headers: List<String> = mutableListOf<String>().apply {
         add("ID")
         add("Name")
         addAll(taskNames.map { it.key.name })
-        addAll(testCaseList)
+        addAll(testCaseList.map { "${it.first}:${it.second.name}" })
     }
 }
 
 class SummaryRow(
-    result: Map.Entry<String, Map<String, Judge>>,
-    studentNameTable: Map<String, String>,
+    result: Map.Entry<StudentID, Map<Pair<TaskName?, TestCase?>, Judge>>,
+    studentNameTable: Map<StudentID, String>,
     summaryHeader: SummaryHeader
 ) {
     val studentID = result.key
     val studentName = studentNameTable[studentID] ?: ""
     private val data = result.value
+
     val stats = summaryHeader.testCaseList.map {
-        data[it] ?: data[it.takeWhile { c -> c != ':' }.plus(':')] ?: data["unknown:"] ?: Judge.NF
+        data[it] ?: data[it.first to null] ?: Judge.NF
     }
     val acceptRatio = summaryHeader.taskNames.mapValues { n ->
-        summaryHeader.testCaseList.filter { it.startsWith(n.key.name) }.count { data[it] == Judge.AC } to n.value
+        summaryHeader.testCaseList.filter { it.first == n.key }.count { data[it] == Judge.AC } to n.value
     }.map { (it.value.first.toFloat()/it.value.second.toFloat()*100f).toInt().toString() }
+
     fun getCsvString(): String {
         return """$studentID,$studentName,${acceptRatio.joinToString()},${stats.joinToString()}"""
     }
@@ -550,8 +595,8 @@ fun writeDetailAndSummaryExcel(
     outputFileStream: FileOutputStream,
     testResults: List<TestResult>,
     workspacePath: Path,
-    resultTable: Map<String, Map<String, Judge>>,
-    studentNameTable: Map<String, String>,
+    resultTable: TestResultTable,
+    studentNameTable: Map<StudentID, String>,
     tasks: Map<TaskName, Task>
 ) {
     WorkbookFactory.create(true).let { it as XSSFWorkbook }.use { workBook ->
@@ -566,6 +611,10 @@ fun writeDetailAndSummaryExcel(
         val dataFormat = workBook.createDataFormat()
         val timeStyle = workBook.createCellStyle().apply {
             setDataFormat(dataFormat.getFormat("#.000"))
+        }
+
+        val wrapStyle = workBook.createCellStyle().apply {
+            wrapText = true
         }
 
         testResults.forEachIndexed { index, result ->
@@ -588,9 +637,18 @@ fun writeDetailAndSummaryExcel(
                     }
                 }
                 row.createCell(9, CellType.STRING).setCellValue(detailRow.expect)
-                row.createCell(10, CellType.STRING).setCellValue(detailRow.output)
-                row.createCell(11, CellType.STRING).setCellValue(detailRow.errorOutput)
-                row.createCell(12, CellType.STRING).setCellValue(detailRow.compileError)
+                row.createCell(10, CellType.STRING).apply {
+                    setCellValue(detailRow.output)
+                    cellStyle = wrapStyle
+                }
+                row.createCell(11, CellType.STRING).apply {
+                    setCellValue(detailRow.errorOutput)
+                    cellStyle = wrapStyle
+                }
+                row.createCell(12, CellType.STRING).apply {
+                    setCellValue(detailRow.compileError)
+                    cellStyle = wrapStyle
+                }
                 row.createCell(13, CellType.STRING).setCellValue(detailRow.packageName)
                 row.createCell(14, CellType.STRING).setCellValue(detailRow.className)
                 row.createCell(15, CellType.STRING).setCellValue(detailRow.command)
@@ -609,7 +667,7 @@ fun writeDetailAndSummaryExcel(
         for(row in resultTable) {
             val summaryRow = SummaryRow(row, studentNameTable, summaryHeader)
             summarySheet.createRow(count).apply {
-                createCell(0, CellType.STRING).setCellValue(summaryRow.studentID)
+                createCell(0, CellType.STRING).setCellValue(summaryRow.studentID.toString())
                 createCell(1, CellType.STRING).setCellValue(summaryRow.studentName)
                 summaryRow.acceptRatio.forEachIndexed { index, i ->
                     createCell(index + 2, CellType.NUMERIC).setCellValue(i.toDouble())
@@ -659,15 +717,19 @@ fun writeDetailAndSummaryExcel(
         sheet.setAutoFilter(CellRangeAddress(0, 0, 0, detailHeader.size))
         detailHeader.indices.forEach { sheet.autoSizeColumn(it) }
 
-        val summaryLastCol = summaryHeader.taskNames.size + 1 + summaryHeader.testCaseList.size
+        val summaryLastCol = summaryHeader.headers.size - 1
         summarySheet.setStatCond(
-            CellRangeAddress(1, resultTable.size, summaryHeader.taskNames.size + 2, summaryLastCol)
+            CellRangeAddress(1, resultTable.size(), summaryHeader.taskNames.size + 2, summaryLastCol)
         )
         summarySheet.setAutoFilter(CellRangeAddress(0, 0, 0, summaryLastCol))
         val color = workBook.creationHelper.createExtendedColor().apply {
-            this.rgb = byteArrayOf(99,142.toByte(),198.toByte())
+            this.rgb = byteArrayOf(99, 142.toByte(), 198.toByte())
         }
-        applyDataBars(summarySheet.sheetConditionalFormatting,CellRangeAddress(1,resultTable.size,2,summaryHeader.taskNames.size+1),color)
+        applyDataBars(
+            summarySheet.sheetConditionalFormatting,
+            CellRangeAddress(1, resultTable.size(), 2, summaryHeader.taskNames.size + 1),
+            color
+        )
         workBook.write(outputFileStream)
     }
 }
@@ -736,8 +798,8 @@ fun writeDetail(
     outputStream: BufferedWriter,
     testResults: List<TestResult>,
     workspacePath: Path,
-    resultTable: Map<String, Map<String, Judge>>,
-    studentNameTable: Map<String, String>
+    resultTable: TestResultTable,
+    studentNameTable: Map<StudentID, String>
 ) {
     outputStream.appendLine(detailHeader.joinToString(","))
     for(result in testResults) {
@@ -749,8 +811,8 @@ fun writeDetail(
 fun writeSummary(
     tasks: Map<TaskName, Task>,
     outputStream: BufferedWriter,
-    resultTable: Map<String, Map<String, Judge>>,
-    studentNameTable: Map<String, String>
+    resultTable: TestResultTable,
+    studentNameTable: Map<StudentID, String>
 ) {
     val summaryHeader = SummaryHeader(tasks)
     outputStream.appendLine(summaryHeader.headers.joinToString())
@@ -772,7 +834,7 @@ fun codeTest(infoForJudge: InfoForJudge, testCase: TestCase, runningTimeOutMilli
 //        classDir = classDir.parent
 //    }
     val command =
-        """java -Duser.language=en -classpath "$classDir" ${infoForJudge.packageName?.plus(".") ?: ""}${infoForJudge.className} ${testCase.arg}"""
+        """java -D"user.language=en" -classpath "$classDir" ${infoForJudge.packageName?.name?.plus(".") ?: ""}${infoForJudge.className} ${testCase.arg}"""
     //println(command)
     val process = runtime.exec(command)
     val startTime = System.nanoTime()
@@ -823,9 +885,9 @@ fun determineTaskNumberAndPackageName(
     config: Config,
     file: File,
     charset: Charset
-): Pair<List<TaskName>, String?> {
-    val taskNames = mutableListOf<TaskName>()
-    var packageName: String? = null
+): Pair<List<TaskName?>, PackageName?> {
+    val taskNames = mutableListOf<TaskName?>()
+    var packageName: PackageName? = null
     for(line in file.readLines(charset)) {
         for((taskName, task) in config.tasks) {
             if(line.contains(task.word)) {
@@ -833,9 +895,13 @@ fun determineTaskNumberAndPackageName(
             }
         }
         val match = packageRegex.find(line) ?: continue
-        packageName = match.groups[1]?.value
+        match.groups[1]?.value?.let {
+            packageName = PackageName(it)
+        }
     }
-    return taskNames to packageName
+    if(taskNames.isEmpty())
+        taskNames += null
+    return taskNames.distinct() to packageName
 }
 
 fun String.contains(strings: Collection<String>): Boolean {
@@ -846,7 +912,7 @@ fun getAllTargetDirectories(path: String): List<File> {
     return File(path).listFiles()?.filter { it.isDirectory && it.name.endsWith("assignsubmission_file_") } ?: listOf()
 }
 
-fun unzipSubmissionZipToWorkspace(submissionDirectory: File, workspacePath: Path): Pair<String, String> {
+fun unzipSubmissionZipToWorkspace(submissionDirectory: File, workspacePath: Path): Pair<StudentID, String> {
     val studentID = submissionDirectory.name.slice(0..7)
     val studentName = submissionDirectory.name.drop(9).takeWhile { it != '_' }
     val dstPath = workspacePath.resolve(studentID).resolve("sources")
@@ -855,7 +921,7 @@ fun unzipSubmissionZipToWorkspace(submissionDirectory: File, workspacePath: Path
     submissionDirectory.listFiles()?.filter { it.name.lowercase().endsWith("zip") }?.forEach { zipFile ->
         unzipFile(zipFile.toPath(), dstPath)
     }
-    return studentID to studentName
+    return StudentID(studentID) to studentName
 }
 
 fun findJavaSourceFiles(targetPath: Path): Sequence<File> {
@@ -883,7 +949,8 @@ fun calcDstPath(keepOriginalDirectory: Boolean?, base: File, studentBase: File, 
 fun compileJavaSource(
     sourceFile: File,
     dstDirectory: Path,
-    compileTimeOutMilli: Long
+    compileTimeOutMilli: Long,
+    classPath: Path
 ): Pair<Either<CompileError, String>, Encoding> {
 
     data class InternalCompileResult(
@@ -896,7 +963,7 @@ fun compileJavaSource(
     fun compileWithEncoding(encoding: String): Result<InternalCompileResult> = runCatching {
         val runtime = Runtime.getRuntime()
         val command =
-            """javac -J-Duser.language=en -d "${dstDirectory.absolutePathString()}" -encoding $encoding "${sourceFile.absolutePath}""""
+            """javac -J-Duser.language=en -d "${dstDirectory.absolutePathString()}" -encoding $encoding -cp "${classPath.absolutePathString()}" "${sourceFile.absolutePath}""""
         val process = runtime.exec(command)
         process.waitFor(compileTimeOutMilli, TimeUnit.MILLISECONDS)
 
@@ -937,9 +1004,17 @@ fun compileJavaSource(
     if(isNotUtf8 && isNotSJis)
         return CompileError("Unknown encoding").left() to Encoding.Unknown
     if(isNotUtf8)
-        return CompileError(sJisResult.fold({ it.errorMessage }, { it.message ?: "exception occurred" })).left() to Encoding.ShiftJIS
+        return CompileError(
+            sJisResult.fold(
+                { it.errorMessage },
+                { it.message ?: "exception occurred" })
+        ).left() to Encoding.ShiftJIS
     if(isNotSJis)
-        return CompileError(utf8Result.fold({ it.errorMessage }, { it.message ?: "exception occurred" })).left() to Encoding.UTF8
+        return CompileError(
+            utf8Result.fold(
+                { it.errorMessage },
+                { it.message ?: "exception occurred" })
+        ).left() to Encoding.UTF8
     println("""ERROR: SJis:${sJisResult.fold({ it }, { it })}   utf8:${utf8Result.fold({ it }, { it })}""")
     return CompileError("unreachable condition").left() to Encoding.Unknown
 }
