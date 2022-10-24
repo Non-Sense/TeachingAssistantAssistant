@@ -855,7 +855,7 @@ fun codeTest(infoForJudge: InfoForJudge, testCase: TestCase, runningTimeOutMilli
     val out = output.replace('\r', ' ').replace('\n', ' ')
     val pass = testCase.expectRegex.firstOrNull()?.matches(out) ?: false
 
-    val runningError = errorOutput.isNotBlank()
+    val runningError = errorOutput.contains("Exception in thread")
     val isCompileError = infoForJudge.compileResult.isLeft()
 
     val stat = when {
