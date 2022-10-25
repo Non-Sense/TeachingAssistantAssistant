@@ -1,7 +1,4 @@
-import arrow.core.Either
 import arrow.core.escaped
-import arrow.core.left
-import arrow.core.right
 import com.charleskorn.kaml.Yaml
 import kotlinx.cli.ArgParser
 import kotlinx.cli.ArgType
@@ -28,8 +25,6 @@ import kotlin.io.path.Path
 import kotlin.io.path.absolutePathString
 
 
-// TODO: REの条件をExceptionにする
-
 enum class Encoding(val charset: Charset) {
     UTF8(Charset.forName("UTF-8")),
     ShiftJIS(Charset.forName("Shift_JIS")),
@@ -44,6 +39,7 @@ enum class Judge(private val displayName: String) {
     CE("CE"),
     IE("IE"),
     NF("NF"),
+    CF("CF"),
     Unknown("??");
 
     companion object {
@@ -64,8 +60,7 @@ enum class Judge(private val displayName: String) {
 }
 
 data class CompileResult(
-    val result: Either<CompileError, String>,
-    val encoding: Encoding,
+    val result: CompileResultDetail,
     val javaSource: File,
     val studentBase: File,
     val base: File,
@@ -78,7 +73,7 @@ data class InfoForJudge(
     val classFileDir: Path,
     val className: String?,
     val packageName: PackageName?,
-    val compileResult: Either<CompileError, String>,
+    val compileResult: CompileResultDetail,
     val javaSource: File
 )
 
@@ -131,11 +126,6 @@ value class TaskName(
 @JvmInline
 value class PackageName(
     val name: String
-)
-
-@JvmInline
-value class CompileError(
-    val message: String
 )
 
 @JvmInline
@@ -320,7 +310,7 @@ suspend fun compile(workspacePath: Path, config: Config, keepOriginalDirectory: 
             jobs.add(CoroutineScope(Dispatchers.Default).async {
                 val res = compileJavaSource(javaSource, dstPath, config.compileTimeout, base.toPath())
                 printProgress(printProgress, counter.addAndGet(1), totalSize)
-                CompileResult(res.first, res.second, javaSource, studentBase, base, dstPath)
+                CompileResult(res, javaSource, studentBase, base, dstPath)
             })
         }
     }
@@ -372,7 +362,7 @@ suspend fun runTests(
         }
         val testcases = config.tasks[info.taskName]
         // CE
-        if(info.compileResult.isLeft()) {
+        if(info.compileResult !is CompileResultDetail.Success) {
             return f(Judge.CE)
         }
         // ??
@@ -397,13 +387,13 @@ suspend fun runTests(
     }
 
     val judgeInfo = compileResults.flatMap {
-        val t = determineTaskNumberAndPackageName(config, it.javaSource, it.encoding.charset)
+        val t = determineTaskNumberAndPackageName(config, it.javaSource, it.result)
         t.first.map { task ->
             InfoForJudge(
                 studentID = StudentID(it.studentBase.name),
                 taskName = task,
                 classFileDir = it.dstDirectory,
-                className = it.result.orNull(),
+                className = (it.result as? CompileResultDetail.Success)?.className,
                 packageName = t.second,
                 compileResult = it.result,
                 javaSource = it.javaSource
@@ -455,25 +445,46 @@ suspend fun runTests(
     }
 }
 
+data class TestResultTableKey(
+    val taskName: TaskName?,
+    val testCase: TestCase?
+)
+
 class TestResultTable {
-    private val table = mutableMapOf<StudentID, MutableMap<Pair<TaskName?, TestCase?>, Judge>>()
+    data class Element(
+        val studentID: StudentID,
+        val value: Map<TestResultTableKey, Map<Path, Judge>>
+    )
+
+    private val table = mutableMapOf<StudentID, MutableMap<TestResultTableKey, MutableMap<Path, Judge>>>()
     fun size() = table.size
-    fun add(studentID: StudentID, taskName: TaskName?, testCase: TestCase?, stat: Judge) {
+    fun add(studentID: StudentID, taskName: TaskName?, testCase: TestCase?, stat: Judge, javaFilePath: Path) {
+        val k = TestResultTableKey(
+            taskName,
+            testCase
+        )
+
         table.computeIfAbsent(studentID) {
             mutableMapOf()
-        }[taskName to testCase] = stat // REVIEW: 合ってるかわからん
+        }.computeIfAbsent(k) {
+            mutableMapOf()
+        }[javaFilePath] = stat
     }
 
-    fun getByStudentID(studentID: StudentID): Map<Pair<TaskName?, TestCase?>, Judge>? {
-        return table[studentID]
+    fun get(studentID: StudentID, taskName: TaskName?, testCase: TestCase?, javaFilePath: Path): Judge? {
+        val k = TestResultTableKey(
+            taskName,
+            testCase
+        )
+        return table[studentID]?.get(k)?.get(javaFilePath)
     }
 
-    fun get(studentID: StudentID, taskName: TaskName?, testCase: TestCase?): Judge? {
-        return table[studentID]?.get(taskName to testCase)
-    }
+    operator fun iterator() = table.iterator()
 
-    operator fun iterator(): Iterator<Map.Entry<StudentID, Map<Pair<TaskName?, TestCase?>, Judge>>> {
-        return table.iterator()
+    fun forEach(action: (Element) -> Unit) {
+        table.forEach { (t, u) ->
+            action(Element(t, u))
+        }
     }
 }
 
@@ -486,7 +497,7 @@ fun makeResultTable(testResults: List<TestResult>): TestResultTable {
         val testCase = result.testCase
         val stat = result.judge
 
-        resultTable.add(studentId, taskName, testCase, stat)
+        resultTable.add(studentId, taskName, testCase, stat, result.judgeInfo.javaSource.toPath())
     }
     return resultTable
 }
@@ -507,7 +518,8 @@ val detailHeader = listOf(
     "compileError",
     "package",
     "class",
-    "runCommand"
+    "runCommand",
+    "compileCommand"
 )
 
 fun String.removeCarriageReturn(): String {
@@ -530,7 +542,16 @@ class DetailRow(
     val packageName = result.judgeInfo.packageName?.name ?: ""
     val className = result.judgeInfo.className ?: ""
     val taskName = result.judgeInfo.taskName ?: TaskName("")
-    val compileError = result.judgeInfo.compileResult.fold({ it.message }, { "" }).removeCarriageReturn()
+    val compileError = when(val it = result.judgeInfo.compileResult) {
+        is CompileResultDetail.Error -> "InternalError:\nUTF8:\n${it.utf8Error.error.stackTraceToString()}\nShiftJIS:\n${it.sJisError.error.stackTraceToString()}".removeCarriageReturn()
+        is CompileResultDetail.Failure -> it.errorMessage.removeCarriageReturn()
+        is CompileResultDetail.Success -> ""
+    }
+    val compileCommand = when(val it = result.judgeInfo.compileResult) {
+        is CompileResultDetail.Error -> "UTF8:${it.utf8Error.compileCommand}\tShiftJIS:${it.sJisError.compileCommand}"
+        is CompileResultDetail.Failure -> it.compileCommand
+        is CompileResultDetail.Success -> it.compileCommand
+    }
     val command = result.command
     val arg = result.testCase?.arg ?: ""
     val input = result.testCase?.input?.joinToString("\n")?.removeCarriageReturn() ?: ""
@@ -542,11 +563,12 @@ class DetailRow(
     val stat = if(result.judgeInfo.taskName == null) Judge.NF.toString() else resultTable.get(
         result.judgeInfo.studentID,
         taskName,
-        result.testCase
+        result.testCase,
+        result.judgeInfo.javaSource.toPath()
     )?.toString() ?: "__"
 
     fun getCsvString(): String {
-        return """$studentId,$studentName,$sourcePath,$taskName,$testCaseName,$arg,${input.csvFormat()},$stat,$time,${expect.csvFormat()},${output.csvFormat()},${errorOutput.csvFormat()},${compileError.csvFormat()},$packageName,$className,$command"""
+        return """$studentId,$studentName,$sourcePath,$taskName,$testCaseName,$arg,${input.csvFormat()},$stat,$time,${expect.csvFormat()},${output.csvFormat()},${errorOutput.csvFormat()},${compileError.csvFormat()},$packageName,$className,$command,$compileCommand"""
     }
 }
 
@@ -571,19 +593,26 @@ class SummaryHeader(
 }
 
 class SummaryRow(
-    result: Map.Entry<StudentID, Map<Pair<TaskName?, TestCase?>, Judge>>,
+    result: TestResultTable.Element,
     studentNameTable: Map<StudentID, String>,
     summaryHeader: SummaryHeader
 ) {
-    val studentID = result.key
+    val studentID = result.studentID
     val studentName = studentNameTable[studentID] ?: ""
     private val data = result.value
 
     val stats = summaryHeader.testCaseList.map {
-        data[it] ?: data[it.first to null] ?: Judge.NF
+        val t = data[TestResultTableKey(it.first, it.second)]
+        val s = data[TestResultTableKey(it.first, null)]
+        when {
+            t?.size == 1 -> t.values.first()
+            t != null && t.size > 1 -> Judge.CF
+            s != null -> s.values.first()
+            else -> Judge.NF
+        }
     }
     val acceptRatio = summaryHeader.taskNames.mapValues { n ->
-        summaryHeader.testCaseList.filter { it.first == n.key }.count { data[it] == Judge.AC } to n.value
+        summaryHeader.testCaseList.filter { it.first == n.key }.count { data[TestResultTableKey(it.first, it.second)]?.count { (_,k) -> k==Judge.AC } == 1 } to n.value
     }.map { (it.value.first.toFloat()/it.value.second.toFloat()*100f).toInt().toString() }
 
     fun getCsvString(): String {
@@ -652,6 +681,7 @@ fun writeDetailAndSummaryExcel(
                 row.createCell(13, CellType.STRING).setCellValue(detailRow.packageName)
                 row.createCell(14, CellType.STRING).setCellValue(detailRow.className)
                 row.createCell(15, CellType.STRING).setCellValue(detailRow.command)
+                row.createCell(16, CellType.STRING).setCellValue(detailRow.compileCommand)
             }
         }
 
@@ -664,7 +694,8 @@ fun writeDetailAndSummaryExcel(
             }
         }
         var count = 1
-        for(row in resultTable) {
+
+        resultTable.forEach { row ->
             val summaryRow = SummaryRow(row, studentNameTable, summaryHeader)
             summarySheet.createRow(count).apply {
                 createCell(0, CellType.STRING).setCellValue(summaryRow.studentID.toString())
@@ -816,7 +847,7 @@ fun writeSummary(
 ) {
     val summaryHeader = SummaryHeader(tasks)
     outputStream.appendLine(summaryHeader.headers.joinToString())
-    for(row in resultTable) {
+    resultTable.forEach { row ->
         val summaryRow = SummaryRow(row, studentNameTable, summaryHeader)
         outputStream.appendLine(summaryRow.getCsvString())
     }
@@ -855,8 +886,9 @@ fun codeTest(infoForJudge: InfoForJudge, testCase: TestCase, runningTimeOutMilli
     val out = output.replace('\r', ' ').replace('\n', ' ')
     val pass = testCase.expectRegex.firstOrNull()?.matches(out) ?: false
 
-    val runningError = errorOutput.contains("Exception in thread")
-    val isCompileError = infoForJudge.compileResult.isLeft()
+    val runningError =
+        errorOutput.contains("Exception in thread") || errorOutput.contains("Error: Main method not found in class")
+    val isCompileError = infoForJudge.compileResult !is CompileResultDetail.Success
 
     val stat = when {
         isTle -> Judge.TLE
@@ -884,8 +916,14 @@ val packageRegex = Regex("""^package\s+(.*)\s*;\s*$""")
 fun determineTaskNumberAndPackageName(
     config: Config,
     file: File,
-    charset: Charset
+    compileResult: CompileResultDetail
 ): Pair<List<TaskName?>, PackageName?> {
+    val charset = when(compileResult) {
+        is CompileResultDetail.Error -> return listOf(null) to null
+        is CompileResultDetail.Failure -> compileResult.encoding.charset
+        is CompileResultDetail.Success -> compileResult.encoding.charset
+    }
+
     val taskNames = mutableListOf<TaskName?>()
     var packageName: PackageName? = null
     for(line in file.readLines(charset)) {
@@ -945,76 +983,117 @@ fun calcDstPath(keepOriginalDirectory: Boolean?, base: File, studentBase: File, 
     }
 }
 
+sealed class CompileResultDetail {
+    data class Success(
+        val compileCommand: String,
+        val encoding: Encoding,
+        val className: String
+    ): CompileResultDetail()
+
+    data class Failure(
+        val compileCommand: String,
+        val encoding: Encoding,
+        val errorMessage: String
+    ): CompileResultDetail()
+
+    data class Error(
+        val utf8Error: CompileErrorDetail,
+        val sJisError: CompileErrorDetail
+    ): CompileResultDetail()
+}
+
+data class CompileErrorDetail(
+    val compileCommand: String,
+    val error: Throwable
+)
 
 fun compileJavaSource(
     sourceFile: File,
     dstDirectory: Path,
     compileTimeOutMilli: Long,
     classPath: Path
-): Pair<Either<CompileError, String>, Encoding> {
-
-    data class InternalCompileResult(
+): CompileResultDetail {
+    data class Detail(
         val exitCode: Int,
         val compiledFilePath: Path?,
         val compiledName: String?,
+        val encoding: Encoding,
+        val encodingError: Boolean = false,
         val errorMessage: String = ""
     )
 
-    fun compileWithEncoding(encoding: String): Result<InternalCompileResult> = runCatching {
-        val runtime = Runtime.getRuntime()
-        val command =
-            """javac -J-Duser.language=en -d "${dstDirectory.absolutePathString()}" -encoding $encoding -cp "${classPath.absolutePathString()}" "${sourceFile.absolutePath}""""
-        val process = runtime.exec(command)
-        process.waitFor(compileTimeOutMilli, TimeUnit.MILLISECONDS)
+    data class InternalCompileResult(
+        val command: String,
+        val detail: Result<Detail>
+    )
 
-        val errorOutput = String(process.errorStream.readBytes())
-        process.destroy()
-        if(errorOutput.isEmpty()) {
-            InternalCompileResult(
-                process.exitValue(),
-                dstDirectory,
-                sourceFile.name.dropLast(5)
-            )
-        } else {
-            InternalCompileResult(
-                process.exitValue(),
-                null,
-                null,
-                errorOutput
-            )
+    fun InternalCompileResult.toDetail(): CompileResultDetail? {
+        val detail = detail.getOrNull() ?: return null
+        if(detail.exitCode == 0 && detail.compiledName != null)
+            return CompileResultDetail.Success(command, detail.encoding, detail.compiledName)
+        if(!detail.encodingError)
+            return CompileResultDetail.Failure(command, detail.encoding, detail.errorMessage)
+        return null
+    }
+
+    fun compileWithEncoding(encoding: Encoding): InternalCompileResult {
+        val command = runCatching {
+            """javac -J-Duser.language=en -d "${dstDirectory.absolutePathString()}" -encoding ${encoding.charset.name()} -cp "${classPath.absolutePathString()}" "${sourceFile.absolutePath}""""
+        }.fold({ it }, { return InternalCompileResult("", Result.failure(it)) })
+        val detail = runCatching {
+            val runtime = Runtime.getRuntime()
+
+            val process = runtime.exec(command)
+            process.waitFor(compileTimeOutMilli, TimeUnit.MILLISECONDS)
+
+            val errorOutput = String(process.errorStream.readBytes())
+            process.destroy()
+            if(errorOutput.isEmpty()) {
+                Detail(
+                    process.exitValue(),
+                    dstDirectory,
+                    sourceFile.name.dropLast(5),
+                    encoding
+                )
+            } else {
+                Detail(
+                    process.exitValue(),
+                    null,
+                    null,
+                    encoding,
+                    errorOutput.contains("error: unmappable character"),
+                    errorOutput
+                )
+            }
         }
+        return InternalCompileResult(command, detail)
     }
 
     if(Files.notExists(dstDirectory))
         Files.createDirectories(dstDirectory)
 
-    val utf8Result = compileWithEncoding("UTF-8")
-    utf8Result.onSuccess {
-        if(it.exitCode == 0 && it.compiledName != null)
-            return it.compiledName.right() to Encoding.UTF8
-    }
-    val sJisResult = compileWithEncoding("Shift_JIS")
-    sJisResult.onSuccess {
-        if(it.exitCode == 0 && it.compiledName != null)
-            return it.compiledName.right() to Encoding.ShiftJIS
+    val utf8Result = compileWithEncoding(Encoding.UTF8)
+    utf8Result.toDetail()?.let {
+        return it
     }
 
-    val isNotUtf8 = utf8Result.map { it.errorMessage.contains("error: unmappable character") }.getOrDefault(false)
-    val isNotSJis = sJisResult.map { it.errorMessage.contains("error: unmappable character") }.getOrDefault(false)
-    if(isNotUtf8 && isNotSJis)
-        return CompileError("Unknown encoding").left() to Encoding.Unknown
-    if(isNotUtf8)
-        return CompileError(
-            sJisResult.fold(
-                { it.errorMessage },
-                { it.message ?: "exception occurred" })
-        ).left() to Encoding.ShiftJIS
-    if(isNotSJis)
-        return CompileError(
-            utf8Result.fold(
-                { it.errorMessage },
-                { it.message ?: "exception occurred" })
-        ).left() to Encoding.UTF8
-    println("""ERROR: SJis:${sJisResult.fold({ it }, { it })}   utf8:${utf8Result.fold({ it }, { it })}""")
-    return CompileError("unreachable condition").left() to Encoding.Unknown
+    val sJisResult = compileWithEncoding(Encoding.ShiftJIS)
+    sJisResult.toDetail()?.let {
+        return it
+    }
+
+    return CompileResultDetail.Error(
+        utf8Error = CompileErrorDetail(
+            utf8Result.command,
+            utf8Result.detail.exceptionOrNull() ?: Throwable("unreachable")
+        ),
+        sJisError = CompileErrorDetail(
+            sJisResult.command,
+            sJisResult.detail.exceptionOrNull() ?: Throwable("unreachable")
+        ),
+    ).also {
+        System.err.println("InternalCompileError: ")
+        it.utf8Error.error.printStackTrace()
+        it.sJisError.error.printStackTrace()
+    }
 }
