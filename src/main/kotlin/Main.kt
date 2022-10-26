@@ -102,6 +102,7 @@ data class TestCase(
 @Serializable
 data class Task(
     val word: List<String>,
+    val excludeWord: List<String> = listOf(),
     val testcase: List<TestCase> = listOf()
 )
 
@@ -110,6 +111,8 @@ data class Config(
     val compileTimeout: Long,
     val runningTimeout: Long,
     val outputFileName: String = "output",
+    val disablePackage: Boolean = false,
+    val allowAmbiguousClassPath: Boolean = false,
     val tasks: Map<TaskName, Task>
 )
 
@@ -211,6 +214,18 @@ suspend fun main(args: Array<String>) {
     val outputCharset = if(outputWithSJIS) Charset.forName("Shift_JIS") else Charset.defaultCharset()
     val submissionDirectories = getAllTargetDirectories(rootPath)
     val workspacePath = Path(rootPath, "workspace")
+    if(config.disablePackage && Files.exists(workspacePath)){
+        runCatching {
+            workspacePath.toFile().walk().forEach {
+                if(it.isFile)
+                    it.delete()
+            }
+        }.onFailure {
+            println("ワークスペースディレクトリの削除に失敗しました")
+            return
+        }
+    }
+
     if(Files.notExists(workspacePath)) {
         runCatching {
             Files.createDirectory(workspacePath)
@@ -219,6 +234,9 @@ suspend fun main(args: Array<String>) {
             return
         }
     }
+
+    if(stepLevel >= 2 && !checkOutputFile(outputToCsv, outputPath, config, outputCharset))
+        return
 
     println("unzipping...")
     val directoryNameRegex = Regex("""^.{8} .*_assignsubmission_file_""")
@@ -244,6 +262,25 @@ suspend fun main(args: Array<String>) {
     println("test done!")
     println()
 
+    val detailHeader: List<String> = mutableListOf(
+        "studentID",
+        "studentName",
+        "sourcePath",
+        "taskName",
+        "testCase",
+        "arg",
+        "input",
+        "stat",
+        "time(ms)",
+        "expect",
+        "stdout",
+        "stderr",
+        "compileError",
+        "package",
+        "class",
+        "runCommand",
+        "compileCommand"
+    ).apply { if(config.allowAmbiguousClassPath) add("failedCompileCommand") }
 
     val resultTable = makeResultTable(testResults)
     if(outputToCsv) {
@@ -255,7 +292,7 @@ suspend fun main(args: Array<String>) {
             println("ファイルがロックされている可能性があります")
             return
         }.use {
-            writeDetail(it, testResults, workspacePath, resultTable, studentNameTable)
+            writeDetail(it, testResults, workspacePath, resultTable, studentNameTable, detailHeader, config)
         }
         val summaryFile = Path(outputPath).resolve(config.outputFileName + "-summary.csv").toFile()
         runCatching {
@@ -274,15 +311,55 @@ suspend fun main(args: Array<String>) {
         runCatching {
             outFile.outputStream()
         }.getOrElse {
-            println("結果詳細ファイルのオープンに失敗しました")
+            println("結果出力ファイルのオープンに失敗しました")
             println("ファイルがロックされている可能性があります")
             return
         }.use {
-            writeDetailAndSummaryExcel(it, testResults, workspacePath, resultTable, studentNameTable, config.tasks)
+            writeDetailAndSummaryExcel(
+                it,
+                testResults,
+                workspacePath,
+                resultTable,
+                studentNameTable,
+                config.tasks,
+                detailHeader,
+                config
+            )
         }
         println("result file wrote to ${outFile.absolutePath}")
     }
 
+}
+
+fun checkOutputFile(outputToCsv: Boolean, outputPath: String, config: Config, outputCharset: Charset): Boolean {
+    if(outputToCsv) {
+        val outFile = Path(outputPath).resolve(config.outputFileName + "-detail.csv").toFile()
+        runCatching {
+            outFile.bufferedWriter(outputCharset)
+        }.getOrElse {
+            println("結果詳細ファイルのオープンに失敗しました")
+            println("ファイルがロックされている可能性があります")
+            return false
+        }.close()
+        val summaryFile = Path(outputPath).resolve(config.outputFileName + "-summary.csv").toFile()
+        runCatching {
+            summaryFile.bufferedWriter(outputCharset)
+        }.getOrElse {
+            println("結果概要ファイルのオープンに失敗しました")
+            println("ファイルがロックされている可能性があります")
+            return false
+        }.close()
+    } else {
+        val outFile = Path(outputPath).resolve(config.outputFileName.plus(".xlsx")).toFile()
+        runCatching {
+            outFile.outputStream()
+        }.getOrElse {
+            println("結果出力ファイルのオープンに失敗しました")
+            println("ファイルがロックされている可能性があります")
+            return false
+        }.close()
+    }
+    return true
 }
 
 fun printProgress(printProgress: AtomicInteger, n: Int, totalSize: Int) {
@@ -308,7 +385,7 @@ suspend fun compile(workspacePath: Path, config: Config, keepOriginalDirectory: 
         findJavaSourceFiles(base.toPath()).forEach { javaSource ->
             val dstPath = calcDstPath(keepOriginalDirectory, base, studentBase, javaSource)
             jobs.add(CoroutineScope(Dispatchers.Default).async {
-                val res = compileJavaSource(javaSource, dstPath, config.compileTimeout, base.toPath())
+                val res = compileJavaSource(javaSource, dstPath, config.compileTimeout, base.toPath(), config)
                 printProgress(printProgress, counter.addAndGet(1), totalSize)
                 CompileResult(res, javaSource, studentBase, base, dstPath)
             })
@@ -502,26 +579,6 @@ fun makeResultTable(testResults: List<TestResult>): TestResultTable {
     return resultTable
 }
 
-val detailHeader = listOf(
-    "studentID",
-    "studentName",
-    "sourcePath",
-    "taskName",
-    "testCase",
-    "arg",
-    "input",
-    "stat",
-    "time(ms)",
-    "expect",
-    "stdout",
-    "stderr",
-    "compileError",
-    "package",
-    "class",
-    "runCommand",
-    "compileCommand"
-)
-
 fun String.removeCarriageReturn(): String {
     return this.replace("\r", "")
 }
@@ -552,6 +609,11 @@ class DetailRow(
         is CompileResultDetail.Failure -> it.compileCommand
         is CompileResultDetail.Success -> it.compileCommand
     }
+    val failedCompileCommand = when(val it = result.judgeInfo.compileResult) {
+        is CompileResultDetail.Error -> null
+        is CompileResultDetail.Failure -> it.prevCompileCommand
+        is CompileResultDetail.Success -> it.prevCompileCommand
+    } ?: ""
     val command = result.command
     val arg = result.testCase?.arg ?: ""
     val input = result.testCase?.input?.joinToString("\n")?.removeCarriageReturn() ?: ""
@@ -567,8 +629,14 @@ class DetailRow(
         result.judgeInfo.javaSource.toPath()
     )?.toString() ?: "__"
 
-    fun getCsvString(): String {
-        return """$studentId,$studentName,$sourcePath,$taskName,$testCaseName,$arg,${input.csvFormat()},$stat,$time,${expect.csvFormat()},${output.csvFormat()},${errorOutput.csvFormat()},${compileError.csvFormat()},$packageName,$className,$command,$compileCommand"""
+    fun getCsvString(config: Config): String {
+        return """$studentId,$studentName,$sourcePath,$taskName,$testCaseName,$arg,${input.csvFormat()},$stat,$time,${expect.csvFormat()},${output.csvFormat()},${errorOutput.csvFormat()},${compileError.csvFormat()},$packageName,$className,$command,$compileCommand""".let {
+            if(config.allowAmbiguousClassPath)
+                "$it,$failedCompileCommand"
+            else
+                it
+        }
+
     }
 }
 
@@ -612,7 +680,8 @@ class SummaryRow(
         }
     }
     val acceptRatio = summaryHeader.taskNames.mapValues { n ->
-        summaryHeader.testCaseList.filter { it.first == n.key }.count { data[TestResultTableKey(it.first, it.second)]?.count { (_,k) -> k==Judge.AC } == 1 } to n.value
+        summaryHeader.testCaseList.filter { it.first == n.key }
+            .count { data[TestResultTableKey(it.first, it.second)]?.count { (_, k) -> k == Judge.AC } == 1 } to n.value
     }.map { (it.value.first.toFloat()/it.value.second.toFloat()*100f).toInt().toString() }
 
     fun getCsvString(): String {
@@ -626,7 +695,9 @@ fun writeDetailAndSummaryExcel(
     workspacePath: Path,
     resultTable: TestResultTable,
     studentNameTable: Map<StudentID, String>,
-    tasks: Map<TaskName, Task>
+    tasks: Map<TaskName, Task>,
+    detailHeader: List<String>,
+    config: Config
 ) {
     WorkbookFactory.create(true).let { it as XSSFWorkbook }.use { workBook ->
         val sheet = workBook.createSheet("Detail")
@@ -682,6 +753,8 @@ fun writeDetailAndSummaryExcel(
                 row.createCell(14, CellType.STRING).setCellValue(detailRow.className)
                 row.createCell(15, CellType.STRING).setCellValue(detailRow.command)
                 row.createCell(16, CellType.STRING).setCellValue(detailRow.compileCommand)
+                if(config.allowAmbiguousClassPath)
+                    row.createCell(17, CellType.STRING).setCellValue(detailRow.failedCompileCommand)
             }
         }
 
@@ -744,8 +817,9 @@ fun writeDetailAndSummaryExcel(
 
         }
 
-        sheet.setStatCond(CellRangeAddress(1, testResults.size, 7, 7))
-        sheet.setAutoFilter(CellRangeAddress(0, 0, 0, detailHeader.size))
+        val statIndex = detailHeader.indexOf("stat")
+        sheet.setStatCond(CellRangeAddress(1, testResults.size, statIndex, statIndex))
+        sheet.setAutoFilter(CellRangeAddress(0, 0, 0, detailHeader.size - 1))
         detailHeader.indices.forEach { sheet.autoSizeColumn(it) }
 
         val summaryLastCol = summaryHeader.headers.size - 1
@@ -830,12 +904,14 @@ fun writeDetail(
     testResults: List<TestResult>,
     workspacePath: Path,
     resultTable: TestResultTable,
-    studentNameTable: Map<StudentID, String>
+    studentNameTable: Map<StudentID, String>,
+    detailHeader: List<String>,
+    config: Config
 ) {
     outputStream.appendLine(detailHeader.joinToString(","))
     for(result in testResults) {
         val detailRow = DetailRow(result, studentNameTable, workspacePath, resultTable)
-        outputStream.appendLine(detailRow.getCsvString())
+        outputStream.appendLine(detailRow.getCsvString(config))
     }
 }
 
@@ -924,22 +1000,29 @@ fun determineTaskNumberAndPackageName(
         is CompileResultDetail.Success -> compileResult.encoding.charset
     }
 
-    val taskNames = mutableListOf<TaskName?>()
+    val taskNames = mutableSetOf<TaskName>()
+    val excludedTasks = mutableSetOf<TaskName>()
     var packageName: PackageName? = null
     for(line in file.readLines(charset)) {
         for((taskName, task) in config.tasks) {
-            if(line.contains(task.word)) {
+            if(line.contains(task.excludeWord)) {
+                taskNames.remove(taskName)
+                excludedTasks.add(taskName)
+            }
+
+            if(!excludedTasks.contains(taskName) && line.contains(task.word)) {
                 taskNames.add(taskName)
             }
         }
+        if(packageName != null) continue
         val match = packageRegex.find(line) ?: continue
         match.groups[1]?.value?.let {
             packageName = PackageName(it)
         }
     }
     if(taskNames.isEmpty())
-        taskNames += null
-    return taskNames.distinct() to packageName
+        return listOf(null) to packageName
+    return taskNames.toList() to packageName
 }
 
 fun String.contains(strings: Collection<String>): Boolean {
@@ -987,13 +1070,15 @@ sealed class CompileResultDetail {
     data class Success(
         val compileCommand: String,
         val encoding: Encoding,
-        val className: String
+        val className: String,
+        val prevCompileCommand: String?
     ): CompileResultDetail()
 
     data class Failure(
         val compileCommand: String,
         val encoding: Encoding,
-        val errorMessage: String
+        val errorMessage: String,
+        val prevCompileCommand: String?
     ): CompileResultDetail()
 
     data class Error(
@@ -1011,13 +1096,15 @@ fun compileJavaSource(
     sourceFile: File,
     dstDirectory: Path,
     compileTimeOutMilli: Long,
-    classPath: Path
+    classPath: Path,
+    config: Config
 ): CompileResultDetail {
     data class Detail(
         val exitCode: Int,
         val compiledFilePath: Path?,
         val compiledName: String?,
         val encoding: Encoding,
+        val prevCompileCommand: String?,
         val encodingError: Boolean = false,
         val errorMessage: String = ""
     )
@@ -1030,15 +1117,21 @@ fun compileJavaSource(
     fun InternalCompileResult.toDetail(): CompileResultDetail? {
         val detail = detail.getOrNull() ?: return null
         if(detail.exitCode == 0 && detail.compiledName != null)
-            return CompileResultDetail.Success(command, detail.encoding, detail.compiledName)
+            return CompileResultDetail.Success(command, detail.encoding, detail.compiledName, detail.prevCompileCommand)
         if(!detail.encodingError)
-            return CompileResultDetail.Failure(command, detail.encoding, detail.errorMessage)
+            return CompileResultDetail.Failure(command, detail.encoding, detail.errorMessage, detail.prevCompileCommand)
         return null
     }
 
-    fun compileWithEncoding(encoding: Encoding): InternalCompileResult {
+    fun compileWithEncoding(
+        file: File,
+        encoding: Encoding,
+        classPath: Path,
+        retry: Boolean = false,
+        prevCompileCommand: String? = null
+    ): InternalCompileResult {
         val command = runCatching {
-            """javac -J-Duser.language=en -d "${dstDirectory.absolutePathString()}" -encoding ${encoding.charset.name()} -cp "${classPath.absolutePathString()}" "${sourceFile.absolutePath}""""
+            """javac -J-Duser.language=en -d "${dstDirectory.absolutePathString()}" -encoding ${encoding.charset.name()} -cp "${classPath.absolutePathString()}" "${file.absolutePath}""""
         }.fold({ it }, { return InternalCompileResult("", Result.failure(it)) })
         val detail = runCatching {
             val runtime = Runtime.getRuntime()
@@ -1050,19 +1143,24 @@ fun compileJavaSource(
             process.destroy()
             if(errorOutput.isEmpty()) {
                 Detail(
-                    process.exitValue(),
-                    dstDirectory,
-                    sourceFile.name.dropLast(5),
-                    encoding
+                    exitCode = process.exitValue(),
+                    compiledFilePath = dstDirectory,
+                    compiledName = file.name.dropLast(5),
+                    encoding = encoding,
+                    prevCompileCommand = prevCompileCommand,
                 )
             } else {
+                if(retry && errorOutput.contains("error: cannot find symbol")) {
+                    return compileWithEncoding(file, encoding, Path(file.parent), false, command)
+                }
                 Detail(
-                    process.exitValue(),
-                    null,
-                    null,
-                    encoding,
-                    errorOutput.contains("error: unmappable character"),
-                    errorOutput
+                    exitCode = process.exitValue(),
+                    compiledFilePath = null,
+                    compiledName = null,
+                    encoding = encoding,
+                    prevCompileCommand = prevCompileCommand,
+                    encodingError = errorOutput.contains("error: unmappable character"),
+                    errorMessage = errorOutput
                 )
             }
         }
@@ -1072,16 +1170,52 @@ fun compileJavaSource(
     if(Files.notExists(dstDirectory))
         Files.createDirectories(dstDirectory)
 
-    val utf8Result = compileWithEncoding(Encoding.UTF8)
+    fun commentOutPackage(file: File, charset: Charset): File {
+        val filepath = file.absolutePath.dropLast(7)
+        val outputFile = File(filepath)
+        val output = outputFile.bufferedWriter(charset)
+        file.forEachLine(charset) {
+            val s = if(packageRegex.matches(it))
+                "// $it"
+            else
+                it
+            output.appendLine(s)
+        }
+        output.close()
+        return outputFile
+    }
+
+    var targetFile = sourceFile
+    if(config.disablePackage) {
+        targetFile = File(sourceFile.absolutePath+".origin")
+        sourceFile.renameTo(targetFile)
+    }
+    val utf8File = if(config.disablePackage) {
+        commentOutPackage(targetFile, Encoding.UTF8.charset)
+    } else {
+        targetFile
+    }
+    val utf8Result = compileWithEncoding(utf8File, Encoding.UTF8, classPath, config.allowAmbiguousClassPath)
     utf8Result.toDetail()?.let {
+        if(config.disablePackage)
+            targetFile.delete()
         return it
     }
 
-    val sJisResult = compileWithEncoding(Encoding.ShiftJIS)
+    val sJisFile = if(config.disablePackage) {
+        commentOutPackage(targetFile, Encoding.UTF8.charset)
+    } else {
+        targetFile
+    }
+    val sJisResult = compileWithEncoding(sJisFile, Encoding.ShiftJIS, classPath, config.allowAmbiguousClassPath)
     sJisResult.toDetail()?.let {
+        if(config.disablePackage)
+            targetFile.delete()
         return it
     }
 
+    if(config.disablePackage)
+        targetFile.delete()
     return CompileResultDetail.Error(
         utf8Error = CompileErrorDetail(
             utf8Result.command,
