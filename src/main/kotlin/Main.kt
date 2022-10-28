@@ -4,8 +4,6 @@ import kotlinx.cli.ArgParser
 import kotlinx.cli.ArgType
 import kotlinx.cli.default
 import kotlinx.coroutines.*
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.Transient
 import org.apache.poi.ss.usermodel.*
 import org.apache.poi.ss.util.CellRangeAddress
 import org.apache.poi.xssf.usermodel.*
@@ -24,47 +22,40 @@ import java.util.concurrent.atomic.AtomicInteger
 import kotlin.io.path.Path
 import kotlin.io.path.absolutePathString
 
-
-enum class Encoding(val charset: Charset) {
-    UTF8(Charset.forName("UTF-8")),
-    ShiftJIS(Charset.forName("Shift_JIS")),
-    Unknown(Charset.defaultCharset())
-}
-
-enum class Judge(private val displayName: String) {
-    AC("AC"),
-    WA("WA"),
-    TLE("TLE"),
-    RE("RE"),
-    CE("CE"),
-    IE("IE"),
-    NF("NF"),
-    CF("CF"),
-    Unknown("??");
-
-    companion object {
-        fun fromStringInput(input: String): Judge {
-            return when(input) {
-                "AC", "A", "ac", "a" -> AC
-                "WA", "W", "wa", "w" -> WA
-                "RE", "R", "re", "r" -> RE
-                "CE", "C", "ce", "c" -> CE
-                else -> Unknown
-            }
-        }
-    }
-
-    override fun toString(): String {
-        return displayName
-    }
-}
-
 data class CompileResult(
     val result: CompileResultDetail,
+    val studentID: StudentID,
     val javaSource: File,
     val studentBase: File,
     val base: File,
-    val dstDirectory: Path
+    val dstDirectory: Path,
+    val id: Int = 0
+)
+
+sealed class CompileResultDetail {
+    data class Success(
+        val compileCommand: String,
+        val encoding: Encoding,
+        val className: String,
+        val prevCompileCommand: String?
+    ): CompileResultDetail()
+
+    data class Failure(
+        val compileCommand: String,
+        val encoding: Encoding,
+        val errorMessage: String,
+        val prevCompileCommand: String?
+    ): CompileResultDetail()
+
+    data class Error(
+        val utf8Error: CompileErrorDetail,
+        val sJisError: CompileErrorDetail
+    ): CompileResultDetail()
+}
+
+data class CompileErrorDetail(
+    val compileCommand: String,
+    val error: String
 )
 
 data class InfoForJudge(
@@ -77,6 +68,12 @@ data class InfoForJudge(
     val javaSource: File
 )
 
+data class TestInfo(
+    val compileResultId: Int,
+    val taskName: TaskName?,
+    val packageName: PackageName?
+)
+
 data class TestResult(
     val output: String = "",
     val errorOutput: String = "",
@@ -87,58 +84,6 @@ data class TestResult(
     val command: String = "",
     val runTimeNano: Long? = null
 )
-
-@Serializable
-data class TestCase(
-    val name: String,
-    val arg: String = "",
-    val input: List<String> = listOf(),
-    val expect: List<String> = listOf()
-) {
-    @Transient
-    val expectRegex = expect.map { Regex(it) }
-}
-
-@Serializable
-data class Task(
-    val word: List<String>,
-    val excludeWord: List<String> = listOf(),
-    val testcase: List<TestCase> = listOf()
-)
-
-@Serializable
-data class Config(
-    val compileTimeout: Long,
-    val runningTimeout: Long,
-    val outputFileName: String = "output",
-    val disablePackage: Boolean = false,
-    val allowAmbiguousClassPath: Boolean = false,
-    val tasks: Map<TaskName, Task>
-)
-
-@Serializable
-@JvmInline
-value class TaskName(
-    val name: String
-) {
-    override fun toString(): String {
-        return name
-    }
-}
-
-@JvmInline
-value class PackageName(
-    val name: String
-)
-
-@JvmInline
-value class StudentID(
-    val id: String
-) {
-    override fun toString(): String {
-        return id
-    }
-}
 
 
 suspend fun main(args: Array<String>) {
@@ -234,6 +179,8 @@ suspend fun main(args: Array<String>) {
             return
         }
     }
+    TADatabase.connect(workspacePath.resolve("database.db").absolutePathString())
+    TADatabase.init()
 
     if(stepLevel >= 2 && !checkOutputFile(outputToCsv, outputPath, config, outputCharset))
         return
@@ -251,14 +198,14 @@ suspend fun main(args: Array<String>) {
         return
 
     println("compiling...")
-    val compileResults = compile(workspacePath, config, keepOriginalDirectory)
+    compile(workspacePath, config, keepOriginalDirectory)
     println("compile done!")
     println()
     if(stepLevel == 1)
         return
 
     println("testing...")
-    val testResults = runTests(config, compileResults, runTestsSerial, manualJudge)
+    val testResults = runTests(config, runTestsSerial, manualJudge)
     println("test done!")
     println()
 
@@ -374,25 +321,37 @@ fun printProgress(printProgress: AtomicInteger, n: Int, totalSize: Int) {
     }
 }
 
-suspend fun compile(workspacePath: Path, config: Config, keepOriginalDirectory: Boolean): List<CompileResult> {
-    val jobs = mutableListOf<Deferred<CompileResult>>()
+suspend fun compile(workspacePath: Path, config: Config, keepOriginalDirectory: Boolean) {
     val counter = AtomicInteger(0)
     val printProgress = AtomicInteger(10)
-    var totalSize = 1
 
-    workspacePath.toFile().listFiles()?.forEach { studentBase ->
+    class Tmp (
+        val javaSource: File,
+        val studentBase: File,
+        val dstPath: Path,
+        val base: File
+    )
+    val sources = workspacePath.toFile().listFiles()?.flatMap { studentBase ->
         val base = studentBase.resolve("sources")
-        findJavaSourceFiles(base.toPath()).forEach { javaSource ->
-            val dstPath = calcDstPath(keepOriginalDirectory, base, studentBase, javaSource)
-            jobs.add(CoroutineScope(Dispatchers.Default).async {
-                val res = compileJavaSource(javaSource, dstPath, config.compileTimeout, base.toPath(), config)
-                printProgress(printProgress, counter.addAndGet(1), totalSize)
-                CompileResult(res, javaSource, studentBase, base, dstPath)
-            })
+        findJavaSourceFiles(base.toPath()).map {
+            val dstPath = calcDstPath(keepOriginalDirectory, base, studentBase, it)
+            Tmp(it,studentBase,dstPath, base)
         }
     }
-    totalSize = jobs.size
-    return jobs.awaitAll().also { println() }
+    val totalSize = sources?.size ?: 1
+
+    val jobs = sources?.map { p ->
+        CoroutineScope(Dispatchers.Default).launch {
+            val res = compileJavaSource(p.javaSource, p.dstPath, config.compileTimeout, p.base.toPath(), config)
+            printProgress(printProgress, counter.addAndGet(1), totalSize)
+            CompileResult(res, StudentID(p.studentBase.name), p.javaSource, p.studentBase, p.base, p.dstPath).also {
+                TADatabase.addCompileResult(it)
+            }
+        }
+    }
+
+    jobs?.joinAll()
+    println()
 }
 
 fun getJudgeFromInput(): Judge {
@@ -415,7 +374,6 @@ fun getJudgeFromInput(): Judge {
 
 suspend fun runTests(
     config: Config,
-    compileResults: List<CompileResult>,
     runTestsSerial: Boolean,
     manualJudge: Boolean
 ): List<TestResult> {
@@ -463,19 +421,24 @@ suspend fun runTests(
         }
     }
 
-    val judgeInfo = compileResults.flatMap {
-        val t = determineTaskNumberAndPackageName(config, it.javaSource, it.result)
-        t.first.map { task ->
-            InfoForJudge(
-                studentID = StudentID(it.studentBase.name),
-                taskName = task,
-                classFileDir = it.dstDirectory,
-                className = (it.result as? CompileResultDetail.Success)?.className,
-                packageName = t.second,
-                compileResult = it.result,
-                javaSource = it.javaSource
-            )
+    val judgeInfo: List<InfoForJudge> = run {
+        val tmp = mutableListOf<InfoForJudge>()
+        TADatabase.forEachCompileResult { it, id ->
+            val t = determineTaskNumberAndPackageName(config, it.javaSource, it.result)
+            val l = t.first.map { task ->
+                InfoForJudge(
+                    studentID = it.studentID,
+                    taskName = task,
+                    classFileDir = it.dstDirectory,
+                    className = (it.result as? CompileResultDetail.Success)?.className,
+                    packageName = t.second,
+                    compileResult = it.result,
+                    javaSource = it.javaSource
+                )
+            }
+            tmp.addAll(l)
         }
+        tmp
     }
 
 
@@ -600,7 +563,7 @@ class DetailRow(
     val className = result.judgeInfo.className ?: ""
     val taskName = result.judgeInfo.taskName ?: TaskName("")
     val compileError = when(val it = result.judgeInfo.compileResult) {
-        is CompileResultDetail.Error -> "InternalError:\nUTF8:\n${it.utf8Error.error.stackTraceToString()}\nShiftJIS:\n${it.sJisError.error.stackTraceToString()}".removeCarriageReturn()
+        is CompileResultDetail.Error -> "InternalError:\nUTF8:\n${it.utf8Error.error}\nShiftJIS:\n${it.sJisError.error}".removeCarriageReturn()
         is CompileResultDetail.Failure -> it.errorMessage.removeCarriageReturn()
         is CompileResultDetail.Success -> ""
     }
@@ -1066,32 +1029,6 @@ fun calcDstPath(keepOriginalDirectory: Boolean?, base: File, studentBase: File, 
     }
 }
 
-sealed class CompileResultDetail {
-    data class Success(
-        val compileCommand: String,
-        val encoding: Encoding,
-        val className: String,
-        val prevCompileCommand: String?
-    ): CompileResultDetail()
-
-    data class Failure(
-        val compileCommand: String,
-        val encoding: Encoding,
-        val errorMessage: String,
-        val prevCompileCommand: String?
-    ): CompileResultDetail()
-
-    data class Error(
-        val utf8Error: CompileErrorDetail,
-        val sJisError: CompileErrorDetail
-    ): CompileResultDetail()
-}
-
-data class CompileErrorDetail(
-    val compileCommand: String,
-    val error: Throwable
-)
-
 fun compileJavaSource(
     sourceFile: File,
     dstDirectory: Path,
@@ -1219,15 +1156,15 @@ fun compileJavaSource(
     return CompileResultDetail.Error(
         utf8Error = CompileErrorDetail(
             utf8Result.command,
-            utf8Result.detail.exceptionOrNull() ?: Throwable("unreachable")
+            (utf8Result.detail.exceptionOrNull() ?: Throwable("unreachable")).stackTraceToString()
         ),
         sJisError = CompileErrorDetail(
             sJisResult.command,
-            sJisResult.detail.exceptionOrNull() ?: Throwable("unreachable")
+            (sJisResult.detail.exceptionOrNull() ?: Throwable("unreachable")).stackTraceToString()
         ),
     ).also {
         System.err.println("InternalCompileError: ")
-        it.utf8Error.error.printStackTrace()
-        it.sJisError.error.printStackTrace()
+        System.err.println(it.utf8Error.error)
+        System.err.println(it.sJisError.error)
     }
 }

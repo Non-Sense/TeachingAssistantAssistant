@@ -15,6 +15,12 @@ repositories {
 }
 
 dependencies {
+    val exposedVersion = "0.40.1"
+    implementation("org.jetbrains.exposed:exposed-core:$exposedVersion")
+    implementation("org.jetbrains.exposed:exposed-dao:$exposedVersion")
+    implementation("org.jetbrains.exposed:exposed-jdbc:$exposedVersion")
+    implementation("org.xerial:sqlite-jdbc:3.39.3.0")
+
     implementation("org.jetbrains.kotlinx:kotlinx-cli:0.3.5")
     implementation("io.arrow-kt:arrow-core:1.1.2")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.4")
@@ -22,7 +28,7 @@ dependencies {
     implementation("org.apache.poi:poi:5.2.2")
     implementation("org.apache.poi:poi-ooxml:5.2.2")
     implementation("org.apache.logging.log4j:log4j-core:2.19.0")
-    testImplementation(kotlin("test"))
+    testImplementation("org.jetbrains.kotlin:kotlin-test:1.7.20")
 }
 
 application {
