@@ -30,6 +30,8 @@ fun unzipFile(targetFilePath: Path, destDirPath: Path = targetFilePath.parent, z
             if(entryPath.startsWith("__MACOSX")){
                 continue
             }
+            if(zipEntry?.isDirectory == false && zipEntry?.name?.endsWith(".class") == true)
+                continue
             if (entryPath.startsWith(Paths.get(".."))) {
                 throw IllegalStateException("File is outside extraction target directory.")
             }

@@ -1,6 +1,7 @@
 import org.jetbrains.exposed.dao.id.IdTable
 import org.jetbrains.exposed.dao.id.IntIdTable
 import org.jetbrains.exposed.sql.*
+import org.jetbrains.exposed.sql.statements.InsertStatement
 import org.jetbrains.exposed.sql.transactions.transaction
 import java.io.File
 import kotlin.io.path.Path
@@ -15,41 +16,29 @@ class TADatabase private constructor(private val db: Database) {
 
         fun init() {
             transaction {
-                SchemaUtils.drop(StudentTable, CompileResultTable)
-                SchemaUtils.create(StudentTable, CompileResultTable)
+                SchemaUtils.drop(StudentTable, CompileResultTable, TestInfoTable)
+                SchemaUtils.create(StudentTable, CompileResultTable, TestInfoTable)
+            }
+        }
+
+        fun addAllStudent(students: Map<StudentID, String>) {
+            transaction {
+                StudentTable.batchInsert(students.asIterable()) {
+                    this[StudentTable.id] = it.key.id
+                    this[StudentTable.name] = it.value
+                }
             }
         }
 
         fun addCompileResult(result: CompileResult): Unit = transaction {
             CompileResultTable.insert {
-                it[javaSource] = result.javaSource.absolutePath
-                it[studentBase] = result.studentBase.absolutePath
-                it[studentID] = result.studentID.id
-                it[base] = result.base.absolutePath
-                it[dstDirectory] = result.dstDirectory.absolutePathString()
-                when(result.result) {
-                    is CompileResultDetail.Error -> {
-                        it[compileStatus] = "Error"
-                        it[utf8ErrorCommand] = result.result.utf8Error.compileCommand
-                        it[utf8Error] = result.result.utf8Error.error
-                        it[sJisErrorCommand] = result.result.sJisError.compileCommand
-                        it[sJisError] = result.result.sJisError.error
-                    }
-                    is CompileResultDetail.Failure -> {
-                        it[compileStatus] = "Failure"
-                        it[compileCommand] = result.result.compileCommand
-                        it[encoding] = result.result.encoding.name
-                        it[errorMessage] = result.result.errorMessage
-                        it[prevCompileCommand] = result.result.prevCompileCommand
-                    }
-                    is CompileResultDetail.Success -> {
-                        it[compileStatus] = "Success"
-                        it[compileCommand] = result.result.compileCommand
-                        it[encoding] = result.result.encoding.name
-                        it[className] = result.result.className
-                        it[prevCompileCommand] = result.result.prevCompileCommand
-                    }
-                }
+                fromCompileResult(it, result)
+            }
+        }
+
+        fun addAllCompileResult(result: Collection<CompileResult>): Unit = transaction {
+            CompileResultTable.batchInsert(result) {
+                CompileResultTable.fromCompileResult(this, it)
             }
         }
 
@@ -61,10 +50,43 @@ class TADatabase private constructor(private val db: Database) {
             }.firstOrNull()?.toCompileResult()
         }
 
-        fun forEachCompileResult(action: (CompileResult, Int)-> Unit) {
+        fun forEachCompileResult(action: (CompileResult) -> Unit) {
             transaction {
                 CompileResultTable.selectAll().forEach {
-                    action(it.toCompileResult(), it[CompileResultTable.id].value)
+                    action(it.toCompileResult())
+                }
+            }
+        }
+
+        fun <R> flatMapCompileResult(transform: (CompileResult) -> Iterable<R>): List<R> {
+            return transaction {
+                CompileResultTable.selectAll().flatMap {
+                    transform(it.toCompileResult())
+                }
+            }
+        }
+
+        fun addAllTestInfo(list: Collection<TestInfo>) {
+            transaction {
+                TestInfoTable.batchInsert(list) {
+                    this[TestInfoTable.compileResultId] = it.compileResultId
+                    this[TestInfoTable.taskName] = it.taskName?.name
+                }
+            }
+        }
+
+        private fun testInfoJoined() = transaction {
+            TestInfoTable.leftJoin(
+                otherTable = CompileResultTable,
+                onColumn = { compileResultId },
+                otherColumn = { CompileResultTable.id }
+            )
+        }
+
+        private fun forEachTestInfoJoined() {
+            transaction {
+                testInfoJoined().selectAll().forEach {
+
                 }
             }
         }
@@ -87,6 +109,7 @@ private object CompileResultTable: IntIdTable("compile_result", "id") {
     val compileStatus = text("compile_status")
     val compileCommand = text("compile_command")
     val encoding = text("encoding")
+    val packageName = text("package_name").nullable()
     val className = text("class_name").default("")
     val prevCompileCommand = text("prev_compile_command").nullable()
     val errorMessage = text("error_message").default("")
@@ -98,7 +121,39 @@ private object CompileResultTable: IntIdTable("compile_result", "id") {
 
 private object TestInfoTable: IntIdTable("test_info", "id") {
     val compileResultId = integer("compile_result_id").references(CompileResultTable.id)
+    val taskName = text("task_name").nullable()
+}
 
+private fun <T: InsertStatement<*>> CompileResultTable.fromCompileResult(it: T, result: CompileResult) {
+    it[javaSource] = result.javaSource.absolutePath
+    it[studentBase] = result.studentBase.absolutePath
+    it[studentID] = result.studentID.id
+    it[base] = result.base.absolutePath
+    it[dstDirectory] = result.dstDirectory.absolutePathString()
+    it[packageName] = result.result.packageName()?.name
+    when(result.result) {
+        is CompileResultDetail.Error -> {
+            it[compileStatus] = "Error"
+            it[utf8ErrorCommand] = result.result.utf8Error.compileCommand
+            it[utf8Error] = result.result.utf8Error.error
+            it[sJisErrorCommand] = result.result.sJisError.compileCommand
+            it[sJisError] = result.result.sJisError.error
+        }
+        is CompileResultDetail.Failure -> {
+            it[compileStatus] = "Failure"
+            it[compileCommand] = result.result.compileCommand
+            it[encoding] = result.result.encoding.name
+            it[errorMessage] = result.result.errorMessage
+            it[prevCompileCommand] = result.result.prevCompileCommand
+        }
+        is CompileResultDetail.Success -> {
+            it[compileStatus] = "Success"
+            it[compileCommand] = result.result.compileCommand
+            it[encoding] = result.result.encoding.name
+            it[className] = result.result.className
+            it[prevCompileCommand] = result.result.prevCompileCommand
+        }
+    }
 }
 
 private fun ResultRow.toCompileResult(): CompileResult {
@@ -122,7 +177,8 @@ private fun ResultRow.toCompileResult(): CompileResult {
                     it[CompileResultTable.compileCommand],
                     Encoding.valueOf(it[CompileResultTable.encoding]),
                     it[CompileResultTable.errorMessage],
-                    it[CompileResultTable.prevCompileCommand]
+                    it[CompileResultTable.prevCompileCommand],
+                    it[CompileResultTable.packageName]?.let { PackageName(it) }
                 )
             }
             "Success" -> {
@@ -130,7 +186,8 @@ private fun ResultRow.toCompileResult(): CompileResult {
                     it[CompileResultTable.compileCommand],
                     Encoding.valueOf(it[CompileResultTable.encoding]),
                     it[CompileResultTable.className],
-                    it[CompileResultTable.prevCompileCommand]
+                    it[CompileResultTable.prevCompileCommand],
+                    it[CompileResultTable.packageName]?.let { PackageName(it) }
                 )
             }
             else -> null
@@ -145,6 +202,15 @@ private fun ResultRow.toCompileResult(): CompileResult {
         File(it[CompileResultTable.javaSource]),
         File(it[CompileResultTable.studentBase]),
         File(it[CompileResultTable.base]),
-        Path(it[CompileResultTable.dstDirectory])
+        Path(it[CompileResultTable.dstDirectory]),
+        it[CompileResultTable.id].value
+    )
+}
+
+private fun ResultRow.toTestInfoJoined(): TestInfoJoined {
+    return TestInfoJoined(
+        taskName = this[TestInfoTable.taskName]?.let { TaskName(it) },
+        packageName = this[CompileResultTable.packageName]?.let { PackageName(it) },
+        compileResult = toCompileResult(),
     )
 }
