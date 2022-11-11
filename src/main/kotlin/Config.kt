@@ -7,7 +7,6 @@ data class Config(
     val runningTimeout: Long,
     val outputFileName: String = "output",
     val disablePackage: Boolean = false,
-    val allowAmbiguousClassPath: Boolean = false,
     val tasks: Map<TaskName, Task>
 )
 

@@ -27,7 +27,6 @@ sealed class CompileResultDetail {
         val compileCommand: String,
         val encoding: Encoding,
         val className: String,
-        val prevCompileCommand: String?,
         val packageName: PackageName?
     ): CompileResultDetail()
 
@@ -35,7 +34,6 @@ sealed class CompileResultDetail {
         val compileCommand: String,
         val encoding: Encoding,
         val errorMessage: String,
-        val prevCompileCommand: String?,
         val packageName: PackageName?
     ): CompileResultDetail()
 
@@ -219,26 +217,6 @@ suspend fun main(args: Array<String>) {
     println("test done!")
     println()
 
-    val detailHeader: List<String> = mutableListOf(
-        "studentID",
-        "studentName",
-        "sourcePath",
-        "taskName",
-        "testCase",
-        "arg",
-        "input",
-        "stat",
-        "time(ms)",
-        "expect",
-        "stdout",
-        "stderr",
-        "compileError",
-        "package",
-        "class",
-        "runCommand",
-        "compileCommand"
-    ).apply { if(config.allowAmbiguousClassPath) add("failedCompileCommand") }
-
     val resultTable = makeResultTable(testResults)
     if(outputToCsv) {
         val outFile = Path(outputPath).resolve(config.outputFileName + "-detail.csv").toFile()
@@ -249,7 +227,7 @@ suspend fun main(args: Array<String>) {
             println("ファイルがロックされている可能性があります")
             return
         }.use {
-            writeDetail(it, testResults, workspacePath, resultTable, studentNameTable, detailHeader, config)
+            writeDetail(it, testResults, workspacePath, resultTable, studentNameTable)
         }
         val summaryFile = Path(outputPath).resolve(config.outputFileName + "-summary.csv").toFile()
         runCatching {
@@ -278,9 +256,7 @@ suspend fun main(args: Array<String>) {
                 workspacePath,
                 resultTable,
                 studentNameTable,
-                config.tasks,
-                detailHeader,
-                config
+                config.tasks
             )
         }
         println("result file wrote to ${outFile.absolutePath}")

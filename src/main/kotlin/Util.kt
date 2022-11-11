@@ -17,7 +17,7 @@ class ProgressPrinter(private val totalSize: Int) {
 }
 
 
-private val packageRegex = Regex("""^package\s+(.*)\s*;\s*$""")
+private val packageRegex = Regex("""^package\s+(.*)\s*;\s*(//|/*).*$""")
 fun determinePackageName(file: File, charset: Charset): PackageName? {
     runCatching {
         for(line in file.readLines(charset)) {

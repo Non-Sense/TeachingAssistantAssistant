@@ -111,7 +111,6 @@ private object CompileResultTable: IntIdTable("compile_result", "id") {
     val encoding = text("encoding")
     val packageName = text("package_name").nullable()
     val className = text("class_name").default("")
-    val prevCompileCommand = text("prev_compile_command").nullable()
     val errorMessage = text("error_message").default("")
     val utf8ErrorCommand = text("utf8_error_command").default("")
     val utf8Error = text("utf8_error").default("")
@@ -144,14 +143,12 @@ private fun <T: InsertStatement<*>> CompileResultTable.fromCompileResult(it: T, 
             it[compileCommand] = result.result.compileCommand
             it[encoding] = result.result.encoding.name
             it[errorMessage] = result.result.errorMessage
-            it[prevCompileCommand] = result.result.prevCompileCommand
         }
         is CompileResultDetail.Success -> {
             it[compileStatus] = "Success"
             it[compileCommand] = result.result.compileCommand
             it[encoding] = result.result.encoding.name
             it[className] = result.result.className
-            it[prevCompileCommand] = result.result.prevCompileCommand
         }
     }
 }
@@ -177,7 +174,6 @@ private fun ResultRow.toCompileResult(): CompileResult {
                     it[CompileResultTable.compileCommand],
                     Encoding.valueOf(it[CompileResultTable.encoding]),
                     it[CompileResultTable.errorMessage],
-                    it[CompileResultTable.prevCompileCommand],
                     it[CompileResultTable.packageName]?.let { PackageName(it) }
                 )
             }
@@ -186,7 +182,6 @@ private fun ResultRow.toCompileResult(): CompileResult {
                     it[CompileResultTable.compileCommand],
                     Encoding.valueOf(it[CompileResultTable.encoding]),
                     it[CompileResultTable.className],
-                    it[CompileResultTable.prevCompileCommand],
                     it[CompileResultTable.packageName]?.let { PackageName(it) }
                 )
             }

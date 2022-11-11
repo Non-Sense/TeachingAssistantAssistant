@@ -12,19 +12,37 @@ import java.nio.file.Path
 import kotlin.io.path.absolutePathString
 
 
+private val detailHeader: List<String> = mutableListOf(
+    "studentID",
+    "studentName",
+    "sourcePath",
+    "taskName",
+    "testCase",
+    "arg",
+    "input",
+    "stat",
+    "time(ms)",
+    "expect",
+    "stdout",
+    "stderr",
+    "compileError",
+    "package",
+    "class",
+    "runCommand",
+    "compileCommand"
+)
+
 fun writeDetail(
     outputStream: BufferedWriter,
     testResults: List<TestResult>,
     workspacePath: Path,
     resultTable: TestResultTable,
-    studentNameTable: Map<StudentID, String>,
-    detailHeader: List<String>,
-    config: Config
+    studentNameTable: Map<StudentID, String>
 ) {
     outputStream.appendLine(detailHeader.joinToString(","))
     for(result in testResults) {
         val detailRow = DetailRow(result, studentNameTable, workspacePath, resultTable)
-        outputStream.appendLine(detailRow.getCsvString(config))
+        outputStream.appendLine(detailRow.getCsvString())
     }
 }
 
@@ -72,11 +90,6 @@ private class DetailRow(
         is CompileResultDetail.Failure -> it.compileCommand
         is CompileResultDetail.Success -> it.compileCommand
     }
-    val failedCompileCommand = when(val it = result.judgeInfo.compileResult) {
-        is CompileResultDetail.Error -> null
-        is CompileResultDetail.Failure -> it.prevCompileCommand
-        is CompileResultDetail.Success -> it.prevCompileCommand
-    } ?: ""
     val command = result.command
     val arg = result.testCase?.arg ?: ""
     val input = result.testCase?.input?.joinToString("\n")?.removeCarriageReturn() ?: ""
@@ -92,14 +105,8 @@ private class DetailRow(
         result.judgeInfo.javaSource.toPath()
     )?.toString() ?: "__"
 
-    fun getCsvString(config: Config): String {
-        return """$studentId,$studentName,$sourcePath,$taskName,$testCaseName,$arg,${input.csvFormat()},$stat,$time,${expect.csvFormat()},${output.csvFormat()},${errorOutput.csvFormat()},${compileError.csvFormat()},$packageName,$className,$command,$compileCommand""".let {
-            if(config.allowAmbiguousClassPath)
-                "$it,$failedCompileCommand"
-            else
-                it
-        }
-
+    fun getCsvString(): String {
+        return """$studentId,$studentName,$sourcePath,$taskName,$testCaseName,$arg,${input.csvFormat()},$stat,$time,${expect.csvFormat()},${output.csvFormat()},${errorOutput.csvFormat()},${compileError.csvFormat()},$packageName,$className,$command,$compileCommand"""
     }
 }
 
@@ -158,9 +165,7 @@ fun writeDetailAndSummaryExcel(
     workspacePath: Path,
     resultTable: TestResultTable,
     studentNameTable: Map<StudentID, String>,
-    tasks: Map<TaskName, Task>,
-    detailHeader: List<String>,
-    config: Config
+    tasks: Map<TaskName, Task>
 ) {
     WorkbookFactory.create(true).let { it as XSSFWorkbook }.use { workBook ->
         val sheet = workBook.createSheet("Detail")
@@ -216,8 +221,6 @@ fun writeDetailAndSummaryExcel(
                 row.createCell(14, CellType.STRING).setCellValue(detailRow.className)
                 row.createCell(15, CellType.STRING).setCellValue(detailRow.command)
                 row.createCell(16, CellType.STRING).setCellValue(detailRow.compileCommand)
-                if(config.allowAmbiguousClassPath)
-                    row.createCell(17, CellType.STRING).setCellValue(detailRow.failedCompileCommand)
             }
         }
 

@@ -3,12 +3,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import java.io.File
-import java.nio.charset.Charset
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.TimeUnit
-import kotlin.io.path.Path
 import kotlin.io.path.absolutePathString
+import kotlin.io.path.name
 
 
 private fun calcDstPath(studentBase: File): Path {
@@ -24,14 +23,13 @@ suspend fun compile(workspacePath: Path, config: Config): List<CompileResult>? {
     class Tmp(
         val javaSource: File,
         val studentBase: File,
-        val dstPath: Path,
         val base: File
     )
 
     val sources = workspacePath.toFile().listFiles()?.flatMap { studentBase ->
         val base = studentBase.resolve("sources")
         findJavaSourceFiles(base.toPath()).map {
-            Tmp(it, studentBase, calcDstPath(studentBase), base)
+            Tmp(it, studentBase, base)
         }
     }
     val totalSize = sources?.size ?: 10
@@ -40,7 +38,7 @@ suspend fun compile(workspacePath: Path, config: Config): List<CompileResult>? {
 
     val jobs = sources?.map { p ->
         CoroutineScope(Dispatchers.Default).async {
-            val res = compileJavaSource(p.javaSource, p.dstPath, config.compileTimeout, p.base.toPath(), config)
+            val res = compileJavaSource(p.javaSource, config.compileTimeout, p.base.toPath())
             printer.add()
             CompileResult(res, StudentID(p.studentBase.name), p.javaSource, p.studentBase, p.base, p.dstPath)
         }
@@ -54,8 +52,7 @@ private data class Detail(
     val compiledFilePath: Path?,
     val compiledName: String?,
     val encoding: Encoding,
-    val prevCompileCommand: String?,
-    val encodingError: Boolean = false,
+    val isEncodingError: Boolean = false,
     val errorMessage: String = ""
 )
 
@@ -72,33 +69,52 @@ private fun InternalCompileResult.toDetail(): CompileResultDetail? {
             command,
             detail.encoding,
             detail.compiledName,
-            detail.prevCompileCommand,
             packageName
         )
-    if(!detail.encodingError)
+    if(!detail.isEncodingError)
         return CompileResultDetail.Failure(
             command,
             detail.encoding,
             detail.errorMessage,
-            detail.prevCompileCommand,
             packageName
         )
     return null
 }
 
+fun determineClassPath(sourceFile: File, packageName: PackageName?): Path? {
+    if(packageName == null)
+        return sourceFile.toPath().parent
+    val packageHierarchy = packageName.name.split('.').reversed()
+    if(packageHierarchy.isEmpty())
+        return sourceFile.toPath().parent
+    var path: Path? = sourceFile.toPath().parent
+    packageHierarchy.forEach {
+        if(path?.fileName?.name != it)
+            return path
+        path = path?.parent
+    }
+    return path
+}
+
 private fun compileWithEncoding(
-    file: File,
+    sourceFile: File,
     encoding: Encoding,
-    classPath: Path,
     dstDirectory: Path,
     compileTimeOutMilli: Long,
-    retry: Boolean = false,
-    prevCompileCommand: String? = null
 ): InternalCompileResult {
-    val packageName = determinePackageName(file, encoding.charset)
+
+    val packageName = determinePackageName(sourceFile, encoding.charset)
+    val classPath = determineClassPath(sourceFile, packageName)
+
     val command = runCatching {
-        """javac -J-Duser.language=en -d "${dstDirectory.absolutePathString()}" -encoding ${encoding.charset.name()} -cp "${classPath.absolutePathString()}" "${file.absolutePath}""""
+        StringBuilder("javac -J-Duser.language=en ").apply {
+            append("""-d "${dstDirectory.absolutePathString()}" """)
+            append("""-encoding ${encoding.charset.name()} """)
+            append("""-cp "${classPath?.absolutePathString() ?: sourceFile.toPath().parent.absolutePathString()}" """)
+            append(""""${sourceFile.absolutePath}"""")
+        }.toString()
     }.fold({ it }, { return InternalCompileResult("", Result.failure(it), packageName) })
+
     val detail = runCatching {
         val runtime = Runtime.getRuntime()
 
@@ -111,110 +127,53 @@ private fun compileWithEncoding(
             Detail(
                 exitCode = process.exitValue(),
                 compiledFilePath = dstDirectory,
-                compiledName = file.name.dropLast(5),
+                compiledName = sourceFile.name.dropLast(5),
                 encoding = encoding,
-                prevCompileCommand = prevCompileCommand,
             )
         } else {
-            if(retry && errorOutput.contains("error: cannot find symbol")) {
-                return compileWithEncoding(
-                    file,
-                    encoding,
-                    Path(file.parent),
-                    dstDirectory,
-                    compileTimeOutMilli,
-                    false,
-                    command
-                )
-            }
             Detail(
                 exitCode = process.exitValue(),
                 compiledFilePath = null,
                 compiledName = null,
                 encoding = encoding,
-                prevCompileCommand = prevCompileCommand,
-                encodingError = errorOutput.contains("error: unmappable character"),
+                isEncodingError = errorOutput.contains("error: unmappable character"),
                 errorMessage = errorOutput
             )
         }
     }
+
     return InternalCompileResult(command, detail, packageName)
 }
 
 private fun compileJavaSource(
     sourceFile: File,
-    dstDirectory: Path,
     compileTimeOutMilli: Long,
-    classPath: Path,
-    config: Config
+    basePath: Path
 ): CompileResultDetail {
-
 
     if(Files.notExists(dstDirectory))
         Files.createDirectories(dstDirectory)
 
-//    fun commentOutPackage(file: File, charset: Charset): File {
-//        val filepath = file.absolutePath.dropLast(7)
-//        val outputFile = File(filepath)
-//        val output = outputFile.bufferedWriter(charset)
-//        file.forEachLine(charset) {
-//            val s = if(packageRegex.matches(it))
-//                "// $it"
-//            else
-//                it
-//            output.appendLine(s)
-//        }
-//        output.close()
-//        return outputFile
-//    }
-
-    var targetFile = sourceFile
-    if(config.disablePackage) {
-        targetFile = File(sourceFile.absolutePath + ".origin")
-        sourceFile.renameTo(targetFile)
-    }
-//    val utf8File = if(config.disablePackage) {
-//        commentOutPackage(targetFile, Encoding.UTF8.charset)
-//    } else {
-//        targetFile
-//    }
-    val utf8File = targetFile
     val utf8Result = compileWithEncoding(
-        utf8File,
-        Encoding.UTF8,
-        classPath,
-        dstDirectory,
-        compileTimeOutMilli,
-        config.allowAmbiguousClassPath
+        sourceFile = sourceFile,
+        encoding = Encoding.UTF8,
+        dstDirectory = dstDirectory,
+        compileTimeOutMilli = compileTimeOutMilli
     )
     utf8Result.toDetail()?.let {
-        if(config.disablePackage)
-            targetFile.delete()
         return it
     }
 
-//    val sJisFile = if(config.disablePackage) {
-//        commentOutPackage(targetFile, Encoding.UTF8.charset)
-//    } else {
-//        targetFile
-//    }
-    val sJisFile = targetFile
     val sJisResult = compileWithEncoding(
-        sJisFile,
-        Encoding.ShiftJIS,
-        classPath,
-        dstDirectory,
-        compileTimeOutMilli,
-        config.allowAmbiguousClassPath
+        sourceFile = sourceFile,
+        encoding = Encoding.ShiftJIS,
+        dstDirectory = dstDirectory,
+        compileTimeOutMilli = compileTimeOutMilli
     )
     sJisResult.toDetail()?.let {
-        if(config.disablePackage)
-            targetFile.delete()
         return it
     }
 
-    if(config.disablePackage)
-        targetFile.delete()
     return CompileResultDetail.Error(
         utf8Error = CompileErrorDetail(
             utf8Result.command,
