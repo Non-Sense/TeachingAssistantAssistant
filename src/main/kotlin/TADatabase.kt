@@ -104,13 +104,14 @@ private object CompileResultTable: IntIdTable("compile_result", "id") {
     val javaSource = text("java_source")
     val studentBase = text("student_base")
     val studentID = text("student_id")
-    val base = text("base")
-    val dstDirectory = text("dst_directory")
+    val sourceBase = text("source_base")
+    val compileBase = text("compile_directory")
     val compileStatus = text("compile_status")
     val compileCommand = text("compile_command")
     val encoding = text("encoding")
     val packageName = text("package_name").nullable()
     val className = text("class_name").default("")
+    val classPath = text("class_path").default("")
     val errorMessage = text("error_message").default("")
     val utf8ErrorCommand = text("utf8_error_command").default("")
     val utf8Error = text("utf8_error").default("")
@@ -125,10 +126,10 @@ private object TestInfoTable: IntIdTable("test_info", "id") {
 
 private fun <T: InsertStatement<*>> CompileResultTable.fromCompileResult(it: T, result: CompileResult) {
     it[javaSource] = result.javaSource.absolutePath
-    it[studentBase] = result.studentBase.absolutePath
+    it[studentBase] = result.studentBase.absolutePathString()
     it[studentID] = result.studentID.id
-    it[base] = result.base.absolutePath
-    it[dstDirectory] = result.dstDirectory.absolutePathString()
+    it[sourceBase] = result.sourceBase.absolutePathString()
+    it[compileBase] = result.compileBase.absolutePathString()
     it[packageName] = result.result.packageName()?.name
     when(result.result) {
         is CompileResultDetail.Error -> {
@@ -149,6 +150,7 @@ private fun <T: InsertStatement<*>> CompileResultTable.fromCompileResult(it: T, 
             it[compileCommand] = result.result.compileCommand
             it[encoding] = result.result.encoding.name
             it[className] = result.result.className
+            it[classPath] = result.result.classPath.absolutePathString()
         }
     }
 }
@@ -179,10 +181,11 @@ private fun ResultRow.toCompileResult(): CompileResult {
             }
             "Success" -> {
                 CompileResultDetail.Success(
-                    it[CompileResultTable.compileCommand],
-                    Encoding.valueOf(it[CompileResultTable.encoding]),
-                    it[CompileResultTable.className],
-                    it[CompileResultTable.packageName]?.let { PackageName(it) }
+                    compileCommand = it[CompileResultTable.compileCommand],
+                    encoding = Encoding.valueOf(it[CompileResultTable.encoding]),
+                    className = it[CompileResultTable.className],
+                    packageName = it[CompileResultTable.packageName]?.let { PackageName(it) },
+                    classPath = Path(it[CompileResultTable.classPath])
                 )
             }
             else -> null
@@ -192,13 +195,13 @@ private fun ResultRow.toCompileResult(): CompileResult {
         CompileErrorDetail("", "")
     )
     return CompileResult(
-        r,
-        StudentID(it[CompileResultTable.studentID]),
-        File(it[CompileResultTable.javaSource]),
-        File(it[CompileResultTable.studentBase]),
-        File(it[CompileResultTable.base]),
-        Path(it[CompileResultTable.dstDirectory]),
-        it[CompileResultTable.id].value
+        result = r,
+        studentID = StudentID(it[CompileResultTable.studentID]),
+        javaSource = File(it[CompileResultTable.javaSource]),
+        studentBase = Path(it[CompileResultTable.studentBase]),
+        sourceBase = Path(it[CompileResultTable.sourceBase]),
+        compileBase = Path(it[CompileResultTable.compileBase]),
+        id = it[CompileResultTable.id].value
     )
 }
 

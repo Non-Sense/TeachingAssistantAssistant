@@ -9,11 +9,6 @@ import java.util.concurrent.TimeUnit
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.name
 
-
-private fun calcDstPath(studentBase: File): Path {
-    return studentBase.toPath().resolve("compile")
-}
-
 private fun findJavaSourceFiles(targetPath: Path): Sequence<File> {
     return targetPath.toFile().walk().filter { it.name.endsWith(".java") }
 }
@@ -22,14 +17,16 @@ suspend fun compile(workspacePath: Path, config: Config): List<CompileResult>? {
 
     class Tmp(
         val javaSource: File,
-        val studentBase: File,
-        val base: File
+        val studentBase: Path,
+        val sourceBase: Path,
+        val compileBase: Path
     )
 
     val sources = workspacePath.toFile().listFiles()?.flatMap { studentBase ->
-        val base = studentBase.resolve("sources")
-        findJavaSourceFiles(base.toPath()).map {
-            Tmp(it, studentBase, base)
+        val base = studentBase.resolve("sources").toPath()
+        val compileBase = studentBase.resolve("compile").toPath()
+        findJavaSourceFiles(base).map {
+            Tmp(it, studentBase.toPath(), base, compileBase)
         }
     }
     val totalSize = sources?.size ?: 10
@@ -38,9 +35,16 @@ suspend fun compile(workspacePath: Path, config: Config): List<CompileResult>? {
 
     val jobs = sources?.map { p ->
         CoroutineScope(Dispatchers.Default).async {
-            val res = compileJavaSource(p.javaSource, config.compileTimeout, p.base.toPath())
+            val res = compileJavaSource(p.javaSource, config.compileTimeout, p.sourceBase, p.compileBase)
             printer.add()
-            CompileResult(res, StudentID(p.studentBase.name), p.javaSource, p.studentBase, p.base, p.dstPath)
+            CompileResult(
+                result = res,
+                studentID = StudentID(p.studentBase.name),
+                javaSource = p.javaSource,
+                studentBase = p.studentBase,
+                sourceBase = p.sourceBase,
+                compileBase = p.compileBase
+            )
         }
     }
 
@@ -49,17 +53,17 @@ suspend fun compile(workspacePath: Path, config: Config): List<CompileResult>? {
 
 private data class Detail(
     val exitCode: Int,
-    val compiledFilePath: Path?,
     val compiledName: String?,
     val encoding: Encoding,
     val isEncodingError: Boolean = false,
-    val errorMessage: String = ""
+    val errorMessage: String = "",
 )
 
 private data class InternalCompileResult(
     val command: String,
     val detail: Result<Detail>,
-    val packageName: PackageName?
+    val packageName: PackageName?,
+    val classPath: Path
 )
 
 private fun InternalCompileResult.toDetail(): CompileResultDetail? {
@@ -69,7 +73,8 @@ private fun InternalCompileResult.toDetail(): CompileResultDetail? {
             command,
             detail.encoding,
             detail.compiledName,
-            packageName
+            packageName,
+            classPath
         )
     if(!detail.isEncodingError)
         return CompileResultDetail.Failure(
@@ -96,24 +101,37 @@ fun determineClassPath(sourceFile: File, packageName: PackageName?): Path? {
     return path
 }
 
+private fun calcDstPath(sourceBasePath: Path, sourceClassPath: Path, compileBasePath: Path): Path {
+    val a = sourceClassPath.absolutePathString().drop(sourceBasePath.absolutePathString().length + 1)
+    if(a.isEmpty())
+        return compileBasePath
+    return compileBasePath.resolve(a)
+}
+
 private fun compileWithEncoding(
     sourceFile: File,
     encoding: Encoding,
-    dstDirectory: Path,
     compileTimeOutMilli: Long,
+    sourceBasePath: Path,
+    compileBasePath: Path
 ): InternalCompileResult {
 
     val packageName = determinePackageName(sourceFile, encoding.charset)
-    val classPath = determineClassPath(sourceFile, packageName)
+    val sourceClassPath = determineClassPath(sourceFile, packageName)
+
+    val dstPath = sourceClassPath?.let { calcDstPath(sourceBasePath, it, compileBasePath) } ?: compileBasePath
+
+    if(Files.notExists(dstPath))
+        Files.createDirectories(dstPath)
 
     val command = runCatching {
         StringBuilder("javac -J-Duser.language=en ").apply {
-            append("""-d "${dstDirectory.absolutePathString()}" """)
+            append("""-d "${dstPath.absolutePathString()}" """)
             append("""-encoding ${encoding.charset.name()} """)
-            append("""-cp "${classPath?.absolutePathString() ?: sourceFile.toPath().parent.absolutePathString()}" """)
+            append("""-cp "${sourceClassPath?.absolutePathString() ?: sourceFile.toPath().parent.absolutePathString()}" """)
             append(""""${sourceFile.absolutePath}"""")
         }.toString()
-    }.fold({ it }, { return InternalCompileResult("", Result.failure(it), packageName) })
+    }.fold({ it }, { return InternalCompileResult("", Result.failure(it), packageName, dstPath) })
 
     val detail = runCatching {
         val runtime = Runtime.getRuntime()
@@ -126,14 +144,12 @@ private fun compileWithEncoding(
         if(errorOutput.isEmpty()) {
             Detail(
                 exitCode = process.exitValue(),
-                compiledFilePath = dstDirectory,
                 compiledName = sourceFile.name.dropLast(5),
                 encoding = encoding,
             )
         } else {
             Detail(
                 exitCode = process.exitValue(),
-                compiledFilePath = null,
                 compiledName = null,
                 encoding = encoding,
                 isEncodingError = errorOutput.contains("error: unmappable character"),
@@ -142,23 +158,22 @@ private fun compileWithEncoding(
         }
     }
 
-    return InternalCompileResult(command, detail, packageName)
+    return InternalCompileResult(command, detail, packageName, dstPath)
 }
 
 private fun compileJavaSource(
     sourceFile: File,
     compileTimeOutMilli: Long,
-    basePath: Path
+    sourceBasePath: Path,
+    compileBasePath: Path
 ): CompileResultDetail {
-
-    if(Files.notExists(dstDirectory))
-        Files.createDirectories(dstDirectory)
 
     val utf8Result = compileWithEncoding(
         sourceFile = sourceFile,
         encoding = Encoding.UTF8,
-        dstDirectory = dstDirectory,
-        compileTimeOutMilli = compileTimeOutMilli
+        compileTimeOutMilli = compileTimeOutMilli,
+        sourceBasePath = sourceBasePath,
+        compileBasePath = compileBasePath
     )
     utf8Result.toDetail()?.let {
         return it
@@ -167,8 +182,9 @@ private fun compileJavaSource(
     val sJisResult = compileWithEncoding(
         sourceFile = sourceFile,
         encoding = Encoding.ShiftJIS,
-        dstDirectory = dstDirectory,
-        compileTimeOutMilli = compileTimeOutMilli
+        compileTimeOutMilli = compileTimeOutMilli,
+        sourceBasePath = sourceBasePath,
+        compileBasePath = compileBasePath
     )
     sJisResult.toDetail()?.let {
         return it

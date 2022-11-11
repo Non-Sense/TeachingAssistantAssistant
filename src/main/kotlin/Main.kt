@@ -16,9 +16,9 @@ data class CompileResult(
     val result: CompileResultDetail,
     val studentID: StudentID,
     val javaSource: File,
-    val studentBase: File,
-    val base: File,
-    val dstDirectory: Path,
+    val studentBase: Path,
+    val sourceBase: Path,
+    val compileBase: Path,
     val id: Int = 0
 )
 
@@ -27,7 +27,8 @@ sealed class CompileResultDetail {
         val compileCommand: String,
         val encoding: Encoding,
         val className: String,
-        val packageName: PackageName?
+        val packageName: PackageName?,
+        val classPath: Path
     ): CompileResultDetail()
 
     data class Failure(
@@ -57,6 +58,14 @@ sealed class CompileResultDetail {
             is Success -> packageName
         }
     }
+
+    fun classPath(): Path? {
+        return when(this) {
+            is Error -> null
+            is Failure -> null
+            is Success -> classPath
+        }
+    }
 }
 
 data class CompileErrorDetail(
@@ -67,7 +76,7 @@ data class CompileErrorDetail(
 data class InfoForJudge(
     val studentID: StudentID,
     val taskName: TaskName?,
-    val classFileDir: Path,
+    val classPath: Path?,
     val className: String?,
     val compileResult: CompileResultDetail,
     val javaSource: File
@@ -375,7 +384,7 @@ suspend fun runTests(
                 InfoForJudge(
                     studentID = it.studentID,
                     taskName = taskName,
-                    classFileDir = it.dstDirectory,
+                    classPath = it.result.classPath(),
                     className = (it.result as? CompileResultDetail.Success)?.className,
                     compileResult = it.result,
                     javaSource = it.javaSource
@@ -492,7 +501,7 @@ fun parseConfigFile(filepath: String): Config {
 
 fun codeTest(infoForJudge: InfoForJudge, testCase: TestCase, runningTimeOutMilli: Long) = runCatching {
     val runtime = Runtime.getRuntime()
-    val classDir = infoForJudge.classFileDir
+    val classDir = infoForJudge.classPath
 //    val n = infoForJudge.packageName?.count { it == '.' }?:0
 //    repeat(n) {
 //        classDir = classDir.parent

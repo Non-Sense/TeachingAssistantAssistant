@@ -100,35 +100,11 @@ expected, stderr, stdoutはそれぞれ空で無いときに表示されます�
 また、`excludeWord`で指定した文字列が一致した場合は、`word`で指定した文字列が一致していたとしても課題の決定はされません。  
 
 
-#### allowAmbiguousClassPathの指定について  
-
-複数のpublicクラスを用いる課題に対してtrueを指定するとコンパイルの成功率が上がります。  
-内部ではjavac実行時に提出zip直下に相当するディレクトリをクラスパスとして指定します。  
-  - 想定しているディレクトリ構成
-    - t100d400.zip <- (展開後にクラスパスに指定される)
-      - source1.java
-      - source2.java
-      - source3.java  
-
-allowAmbiguousClassPathにtrueを指定すると、`cannot find symbol`エラーが発生した場合にソースファイルの1つ上のディレクトリをクラスパスに指定してコンパイルを再試行します。  
-  - 効果があるディレクトリ構成
-    - t100d400.zip
-      - t100d400
-        - kadai1
-          - source1.java
-          - source2.java
-        - kadai2
-          - source3.java  
-
-ソースファイル内に無効なpackageが記述されているときはコンパイルに失敗します。  
-
 
 ``` yaml
 compileTimeout: 3000                # コンパイルのタイムアウト時間(ミリ秒)
 runningTimeout: 5000                # 実行時間のタイムアウト(ミリ秒)
 outputFileName: output              # 出力するファイル名(拡張子は自動で付与されます)
-disablePackage: true                # パッケージ文をコメントアウトします(デフォルト:false, 省略可)
-allowAmbiguousClassPath: true       # パッケージ階層が不正でも少し許容します(デフォルト:false, 省略可)
 tasks:
   課題1:                            # 課題名を指定する
     word:                           # ソースファイルの"どの課題用かコメント"の検索用ワード
