@@ -9,6 +9,7 @@ import java.nio.charset.Charset
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.CoroutineContext
 import kotlin.io.path.Path
 import kotlin.io.path.absolutePathString
 
@@ -340,7 +341,7 @@ suspend fun runTests(
 
     fun makeTestJob(info: InfoForJudge): List<Pair<Deferred<TestResult>, Pair<InfoForJudge, TestCase?>>> {
         fun f(judge: Judge): List<Pair<Deferred<TestResult>, Pair<InfoForJudge, TestCase?>>> {
-            return listOf(CoroutineScope(Dispatchers.Default).async {
+            return listOf(CoroutineScope(Dispatchers.Default).async(start = CoroutineStart.LAZY) {
                 if(!runTestsSerial)
                     printer.add()
                 TestResult(judgeInfo = info, judge = judge)
@@ -361,7 +362,7 @@ suspend fun runTests(
         }
         // run test
         return testcases.testcase.map { testcase ->
-            CoroutineScope(Dispatchers.Default).async {
+            CoroutineScope(Dispatchers.Default).async(start = CoroutineStart.LAZY) {
                 codeTest(info, testcase, config.runningTimeout).getOrElse {
                     TestResult(
                         errorOutput = "internal error: ${it.stackTraceToString().replace("\r", "").escaped()}",
@@ -499,7 +500,7 @@ fun parseConfigFile(filepath: String): Config {
     return Yaml.default.decodeFromStream(Config.serializer(), Path(filepath).toFile().inputStream())
 }
 
-fun codeTest(infoForJudge: InfoForJudge, testCase: TestCase, runningTimeOutMilli: Long) = runCatching {
+suspend fun codeTest(infoForJudge: InfoForJudge, testCase: TestCase, runningTimeOutMilli: Long) = runCatching {
     val runtime = Runtime.getRuntime()
     val classDir = infoForJudge.classPath
 //    val n = infoForJudge.packageName?.count { it == '.' }?:0
@@ -518,11 +519,31 @@ fun codeTest(infoForJudge: InfoForJudge, testCase: TestCase, runningTimeOutMilli
         }
     }
     outputStream.flush()
-    val isTle = !process.waitFor(runningTimeOutMilli, TimeUnit.MILLISECONDS)
+    val inputStream = process.inputStream
+    var output = ""
+    val job = CoroutineScope(Dispatchers.Default).launch {
+        while(true) {
+            if(inputStream.available() < 0) {
+                delay(100)
+                continue
+            }
+            output += String(inputStream.readBytes(), Charset.forName("Shift_JIS"))
+            //delay(100)
+        }
+    }
+    val isTle = if(runningTimeOutMilli < 0){
+        process.waitFor()
+        false
+    } else {
+        !process.waitFor(runningTimeOutMilli, TimeUnit.MILLISECONDS)
+    }
+    //val isTle = !process.waitFor(runningTimeOutMilli, TimeUnit.MILLISECONDS)
     val runTime = System.nanoTime() - startTime
     process.destroyForcibly()
     val errorOutput = String(process.errorStream.readBytes(), Charset.forName("Shift_JIS"))
-    val output = String(process.inputStream.readBytes(), Charset.forName("Shift_JIS"))
+    //val output = String(process.inputStream.readBytes(), Charset.forName("Shift_JIS"))
+    job.cancel()
+    output += String(inputStream.readBytes(), Charset.forName("Shift_JIS"))
 
 
     val out = output.replace('\r', ' ').replace('\n', ' ')

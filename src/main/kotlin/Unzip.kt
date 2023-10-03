@@ -25,7 +25,10 @@ fun unzipFile(targetFilePath: Path, destDirPath: Path = targetFilePath.parent, z
         var nEntries = 0
         var totalReads = 0L
         val buffer = ByteArray(unzipBufferSize)
-        while (f.nextEntry.also { zipEntry = it } != null) {
+        while (true) {
+            zipEntry = runCatching {
+                f.nextEntry
+            }.getOrNull() ?: break
             val entryPath = Paths.get(zipEntry!!.name).normalize()
             if(entryPath.startsWith("__MACOSX")){
                 continue
